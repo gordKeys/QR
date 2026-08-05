@@ -223,14 +223,21 @@ def spread_filter(symbol, broker, price, atr, max_spread_points=40, max_spread_a
     info = broker.symbol_info(symbol)
     tick = broker.symbol_tick(symbol)
     if info is None or tick is None:
-        return False, None, None
+        return False, None, None, None
 
     point = float(getattr(info, "point", 0.0) or 0.0)
+    symbol_name = str(getattr(info, "name", symbol) or symbol).upper()
+    rule_name = "forex"
+    if symbol_name.startswith("XAU"):
+        rule_name = "xauusd"
+        max_spread_points = 220
+        max_spread_atr_ratio = 0.28
+
     spread = None
     if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
         spread = float(tick.ask - tick.bid)
     if spread is None:
-        return False, None, None
+        return False, None, None, rule_name
 
     spread_points = spread / point if point > 0 else None
     point_threshold = max_spread_points * point if point > 0 else None
@@ -241,9 +248,9 @@ def spread_filter(symbol, broker, price, atr, max_spread_points=40, max_spread_a
             allowed = threshold if allowed is None else max(allowed, threshold)
 
     if allowed is None:
-        return False, spread, None
+        return False, spread, None, rule_name
 
-    return spread > allowed, spread, allowed
+    return spread > allowed, spread, allowed, rule_name
 
 
 def structure_stop_from_data(data, symbol, broker, direction, price, atr, lookback=12, buffer_atr=0.35):
@@ -748,9 +755,12 @@ def main():
                 broker_time = data.index[-1].to_pydatetime()
 
                 if broker and not args.dry_run:
-                    spread_blocked, spread_value, spread_limit = spread_filter(symbol, broker, None, atr)
+                    spread_blocked, spread_value, spread_limit, spread_rule = spread_filter(symbol, broker, None, atr)
                     if spread_blocked:
-                        print(f"{symbol}: skipped because spread is too wide")
+                        print(
+                            f"{symbol}: skipped because spread is too wide "
+                            f"(spread={spread_value:.5f}, limit={spread_limit:.5f}, rule={spread_rule})"
+                        )
                         append_jsonl(
                             run_log,
                             {
@@ -759,6 +769,7 @@ def main():
                                 "reason": "spread_too_wide",
                                 "spread": spread_value,
                                 "spread_limit": spread_limit,
+                                "spread_rule": spread_rule,
                                 "broker_time": broker_time,
                             },
                         )
