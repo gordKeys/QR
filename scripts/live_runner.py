@@ -201,9 +201,272 @@ def update_trade_mfe(trade_states, position, new_profit):
     return False, state
 
 
+def higher_timeframe_direction(data, timeframe="1h", ema_span=20):
+    if data is None or data.empty or len(data) < ema_span + 5:
+        return None
+
+    higher = data[["open", "high", "low", "close", "tick_volume"]].resample(timeframe).agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "tick_volume": "sum"}
+    ).dropna()
+    if len(higher) < ema_span + 3:
+        return None
+
+    ema = higher["close"].ewm(span=ema_span, adjust=False).mean()
+    if higher["close"].iloc[-1] > ema.iloc[-1]:
+        return "UP"
+    if higher["close"].iloc[-1] < ema.iloc[-1]:
+        return "DOWN"
+    return None
+
+
+def spread_filter(symbol, broker, price, atr, max_spread_points=40, max_spread_atr_ratio=0.12):
+    info = broker.symbol_info(symbol)
+    tick = broker.symbol_tick(symbol)
+    if info is None or tick is None:
+        return False, None, None
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    spread = None
+    if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
+        spread = float(tick.ask - tick.bid)
+    if spread is None:
+        return False, None, None
+
+    spread_points = spread / point if point > 0 else None
+    point_threshold = max_spread_points * point if point > 0 else None
+    atr_threshold = atr * max_spread_atr_ratio if atr and atr > 0 else None
+    allowed = None
+    for threshold in (point_threshold, atr_threshold):
+        if threshold is not None and threshold > 0:
+            allowed = threshold if allowed is None else max(allowed, threshold)
+
+    if allowed is None:
+        return False, spread, None
+
+    return spread > allowed, spread, allowed
+
+
+def structure_stop_from_data(data, symbol, broker, direction, price, atr, lookback=12, buffer_atr=0.35):
+    if broker is None:
+        return None
+
+    info = broker.symbol_info(symbol)
+    if info is None or data is None or data.empty:
+        return None
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    digits = int(getattr(info, "digits", 2) or 2)
+    min_stop_distance = float(getattr(info, "trade_stops_level", 0.0) or 0.0) * point
+    if len(data) < lookback + 2:
+        return None
+
+    window = data.iloc[-(lookback + 1):-1]
+    atr_buffer = max((atr or 0.0) * buffer_atr, min_stop_distance, point * 2)
+
+    if direction == 1:
+        swing_low = float(window["low"].min())
+        candidate = min(float(price) - max(min_stop_distance, atr_buffer), swing_low - atr_buffer)
+        return round(candidate, digits)
+
+    if direction == -1:
+        swing_high = float(window["high"].max())
+        candidate = max(float(price) + max(min_stop_distance, atr_buffer), swing_high + atr_buffer)
+        return round(candidate, digits)
+
+    return None
+
+
+def partial_close_volume(position, broker):
+    info = broker.symbol_info(position.symbol)
+    if info is None:
+        return 0.0
+
+    min_volume = float(getattr(info, "volume_min", 0.01) or 0.01)
+    total_volume = float(getattr(position, "volume", 0.0) or 0.0)
+    if total_volume <= 0:
+        return 0.0
+
+    close_volume = broker.normalize_volume(position.symbol, total_volume / 2.0)
+    if close_volume < min_volume:
+        return 0.0
+    if total_volume - close_volume < min_volume:
+        return 0.0
+    return close_volume
+
+
+def manage_open_position(symbol, data, broker, position, state, args, started, run_log):
+    info = broker.symbol_info(symbol)
+    tick = broker.symbol_tick(symbol)
+    if info is None or tick is None:
+        return state
+
+    direction = position_side(position, broker)
+    current_price = float(tick.bid if direction == 1 else tick.ask)
+    current_profit = float(getattr(position, "profit", 0.0) or 0.0)
+    updated, state = update_trade_mfe({symbol: state}, position, current_profit)
+    if updated:
+        append_jsonl(
+            run_log,
+            {
+                "event": "position_mfe_update",
+                "symbol": symbol,
+                "ticket": getattr(position, "ticket", None),
+                "mfe_usd": state["mfe_usd"],
+                "current_profit": current_profit,
+                "time": started,
+            },
+        )
+
+    contract_size = float(state.get("contract_size") or getattr(info, "trade_contract_size", 100000.0) or 100000.0)
+    entry_price = float(state.get("entry_price") or getattr(position, "price_open", 0.0) or 0.0)
+    initial_stop = float(state.get("initial_stop") or getattr(position, "sl", 0.0) or 0.0)
+    if state.get("risk_usd") is None and entry_price and initial_stop and contract_size > 0:
+        state["risk_usd"] = abs(entry_price - initial_stop) * float(getattr(position, "volume", 0.0) or 0.0) * contract_size
+
+    current_stop = float(getattr(position, "sl", 0.0) or 0.0)
+    structure_stop = structure_stop_from_data(data, symbol, broker, direction, current_price, float(data["atr"].iloc[-1]), lookback=12)
+
+    if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
+        break_even_sl = estimate_break_even_stop(
+            position,
+            broker,
+            args.break_even_commission_round_turn,
+        )
+        if break_even_sl is not None:
+            candidate_stop = break_even_sl
+            if structure_stop is not None:
+                candidate_stop = max(candidate_stop, structure_stop) if direction == 1 else min(candidate_stop, structure_stop)
+            if direction == 1 and candidate_stop < current_price:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=candidate_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["break_even_moved"] = True
+                    state["break_even_sl"] = candidate_stop
+                    current_stop = candidate_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "break_even_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "profit_usd": current_profit,
+                            "new_stop": candidate_stop,
+                            "mfe_usd": state["mfe_usd"],
+                            "time": started,
+                        },
+                    )
+            elif direction == -1 and candidate_stop > current_price:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=candidate_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["break_even_moved"] = True
+                    state["break_even_sl"] = candidate_stop
+                    current_stop = candidate_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "break_even_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "profit_usd": current_profit,
+                            "new_stop": candidate_stop,
+                            "mfe_usd": state["mfe_usd"],
+                            "time": started,
+                        },
+                    )
+
+    risk_usd = float(state.get("risk_usd") or 0.0)
+    if not state.get("partial_taken") and risk_usd > 0 and current_profit >= risk_usd:
+        close_volume = partial_close_volume(position, broker)
+        if close_volume > 0:
+            close_result = broker.close_position_partial(
+                position_ticket=getattr(position, "ticket", None),
+                symbol=symbol,
+                direction=direction,
+                volume=close_volume,
+            )
+            accepted = close_result is not None and getattr(close_result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+            if accepted:
+                state["partial_taken"] = True
+                state["partial_closed_volume"] = close_volume
+                append_jsonl(
+                    run_log,
+                    {
+                        "event": "partial_profit_taken",
+                        "symbol": symbol,
+                        "ticket": getattr(position, "ticket", None),
+                        "close_volume": close_volume,
+                        "profit_usd": current_profit,
+                        "risk_usd": risk_usd,
+                        "time": started,
+                    },
+                )
+
+    trail_allowed = state.get("partial_taken") or state.get("break_even_moved")
+    if trail_allowed and structure_stop is not None:
+        if direction == 1:
+            candidate_stop = structure_stop if current_stop <= 0 else max(current_stop, structure_stop)
+            if candidate_stop > 0 and candidate_stop < current_price and candidate_stop > current_stop:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=candidate_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["trail_sl"] = candidate_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "trail_stop_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "new_stop": candidate_stop,
+                            "current_profit": current_profit,
+                            "time": started,
+                        },
+                    )
+        elif direction == -1:
+            candidate_stop = structure_stop if current_stop <= 0 else min(current_stop, structure_stop)
+            if candidate_stop > current_price and (current_stop <= 0 or candidate_stop < current_stop):
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=candidate_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["trail_sl"] = candidate_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "trail_stop_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "new_stop": candidate_stop,
+                            "current_profit": current_profit,
+                            "time": started,
+                        },
+                    )
+
+    return state
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
+    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
@@ -215,7 +478,7 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
-    parser.add_argument("--break-even-trigger-usd", type=float, default=100.0)
+    parser.add_argument("--break-even-trigger-usd", type=float, default=190.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
     args = parser.parse_args()
 
@@ -325,10 +588,10 @@ def main():
                     symbol = getattr(deal, "symbol", "")
                     stop_loss_hit = deal_is_stop_loss(deal, broker)
                     revenge_active = revenge.is_active(symbol)
+                    open_positions_after = broker.positions_get(symbol=symbol)
+                    is_final_close = not open_positions_after
 
-                    last_closed_pnl = profit
-                    guard.register_closed_trade(profit)
-                    trade_state = trade_states.pop(symbol, {})
+                    trade_state = trade_states.get(symbol, {})
                     append_jsonl(
                         run_log,
                         {
@@ -340,8 +603,16 @@ def main():
                             "mfe_usd": trade_state.get("mfe_usd"),
                             "break_even_moved": trade_state.get("break_even_moved", False),
                             "break_even_sl": trade_state.get("break_even_sl"),
+                            "is_final_close": is_final_close,
                         },
                     )
+
+                    if not is_final_close:
+                        continue
+
+                    last_closed_pnl = profit
+                    guard.register_closed_trade(profit)
+                    trade_state = trade_states.pop(symbol, {})
 
                     if args.revenge_mode and stop_loss_hit:
                         breaker_state = symbol_breaker.register_close(symbol, stop_loss_hit, revenge_failed=revenge_active)
@@ -423,50 +694,10 @@ def main():
                     if positions:
                         current_position = positions[0]
                         state = ensure_trade_state(trade_states, current_position)
-                        current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
-                        updated, state = update_trade_mfe(trade_states, current_position, current_profit)
-                        if updated:
-                            append_jsonl(
-                                run_log,
-                                {
-                                    "event": "position_mfe_update",
-                                    "symbol": symbol,
-                                    "ticket": getattr(current_position, "ticket", None),
-                                    "mfe_usd": state["mfe_usd"],
-                                    "current_profit": current_profit,
-                                    "time": started,
-                                },
-                            )
-
-                        if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
-                            break_even_sl = estimate_break_even_stop(
-                                current_position,
-                                broker,
-                                args.break_even_commission_round_turn,
-                            )
-                            if break_even_sl is not None:
-                                result = broker.modify_position_stops(
-                                    position_ticket=getattr(current_position, "ticket", None),
-                                    symbol=symbol,
-                                    stop_loss=break_even_sl,
-                                    take_profit=getattr(current_position, "tp", None),
-                                )
-                                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
-                                if accepted:
-                                    state["break_even_moved"] = True
-                                    state["break_even_sl"] = break_even_sl
-                                    append_jsonl(
-                                        run_log,
-                                        {
-                                            "event": "break_even_moved",
-                                            "symbol": symbol,
-                                            "ticket": getattr(current_position, "ticket", None),
-                                            "profit_usd": current_profit,
-                                            "new_stop": break_even_sl,
-                                            "mfe_usd": state["mfe_usd"],
-                                            "time": started,
-                                        },
-                                    )
+                        state = manage_open_position(symbol, data, broker, current_position, state, args, started, run_log)
+                        trade_states[symbol] = state
+                        cycle_counts["managed_position"] += 1
+                        continue
 
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
@@ -517,6 +748,57 @@ def main():
                 broker_time = data.index[-1].to_pydatetime()
 
                 if broker and not args.dry_run:
+                    spread_blocked, spread_value, spread_limit = spread_filter(symbol, broker, None, atr)
+                    if spread_blocked:
+                        print(f"{symbol}: skipped because spread is too wide")
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip",
+                                "symbol": symbol,
+                                "reason": "spread_too_wide",
+                                "spread": spread_value,
+                                "spread_limit": spread_limit,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["skip_spread"] += 1
+                        continue
+
+                htf_bias = higher_timeframe_direction(data)
+                if htf_bias is not None:
+                    if signal == 1 and htf_bias == "DOWN":
+                        print(f"{symbol}: skipped because higher timeframe is bearish")
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip",
+                                "symbol": symbol,
+                                "reason": "htf_bias_down",
+                                "signal": signal,
+                                "htf_bias": htf_bias,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["skip_htf_bias"] += 1
+                        continue
+                    if signal == -1 and htf_bias == "UP":
+                        print(f"{symbol}: skipped because higher timeframe is bullish")
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip",
+                                "symbol": symbol,
+                                "reason": "htf_bias_up",
+                                "signal": signal,
+                                "htf_bias": htf_bias,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["skip_htf_bias"] += 1
+                        continue
+
+                if broker and not args.dry_run:
                     tick = broker.symbol_tick(symbol)
                     if tick is None:
                         print(f"{symbol}: no live tick available")
@@ -565,40 +847,47 @@ def main():
                     price = float(strategy_plan.get("price", price))
                     stop = float(strategy_plan.get("stop"))
                     target = float(strategy_plan.get("target"))
-                    size = float(strategy_plan.get("size")) * revenge_context["multiplier"]
                     size_reason = strategy_plan.get("size_reason", "strategy_plan")
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
 
-                    if broker and not args.dry_run:
-                        stop, target = broker.conform_stop_levels(symbol, signal, price, stop, target)
-                        if stop is None or target is None:
-                            print(f"{symbol}: skipped because broker stop levels are invalid")
-                            cycle_counts["skip_invalid_stops"] += 1
-                            append_jsonl(
-                                run_log,
-                                {
-                                    "event": "skip_invalid_stops",
-                                    "symbol": symbol,
-                                    "signal": signal,
-                                    "price": price,
-                                    "broker_time": broker_time,
-                                },
-                            )
-                            continue
-                        size, size_reason = calculate_trade_volume(
-                            broker=broker,
-                            symbol=symbol,
-                            direction=signal,
-                            entry_price=price,
-                            stop_price=stop,
-                            account_equity=equity,
-                            risk_per_trade=rules.max_risk_per_trade_pct,
-                            size_multiplier=revenge_context["multiplier"],
-                        )
+                structure_stop = structure_stop_from_data(data, symbol, broker if broker is not None else broker, signal, price, atr)
+                if structure_stop is not None:
+                    if signal == 1:
+                        stop = min(stop, structure_stop)
                     else:
-                        size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
-                        size_reason = "dry_run"
+                        stop = max(stop, structure_stop)
+
+                if broker and not args.dry_run:
+                    stop, target = broker.conform_stop_levels(symbol, signal, price, stop, target)
+                    if stop is None or target is None:
+                        print(f"{symbol}: skipped because broker stop levels are invalid")
+                        cycle_counts["skip_invalid_stops"] += 1
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip_invalid_stops",
+                                "symbol": symbol,
+                                "signal": signal,
+                                "price": price,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        continue
+
+                    size, size_reason = calculate_trade_volume(
+                        broker=broker,
+                        symbol=symbol,
+                        direction=signal,
+                        entry_price=price,
+                        stop_price=stop,
+                        account_equity=equity,
+                        risk_per_trade=rules.max_risk_per_trade_pct,
+                        size_multiplier=revenge_context["multiplier"],
+                    )
+                else:
+                    size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
+                    size_reason = "dry_run"
 
                 if size <= 0:
                     print(f"{symbol}: skipped due to sizing ({size_reason})")
@@ -652,11 +941,21 @@ def main():
                         positions = broker.positions_get(symbol=symbol)
                         if positions:
                             current_position = positions[0]
+                            contract_size = float(getattr(broker.symbol_info(symbol), "trade_contract_size", 100000.0) or 100000.0)
                             trade_states[symbol] = {
                                 "ticket": getattr(current_position, "ticket", None),
+                                "entry_price": float(getattr(current_position, "price_open", price) or price),
+                                "initial_stop": float(getattr(current_position, "sl", stop) or stop),
+                                "initial_target": float(getattr(current_position, "tp", target) or target),
+                                "volume": float(getattr(current_position, "volume", size) or size),
+                                "contract_size": contract_size,
+                                "risk_usd": abs(float(price) - float(stop)) * float(getattr(current_position, "volume", size) or size) * contract_size,
                                 "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
                                 "break_even_moved": False,
                                 "break_even_sl": None,
+                                "partial_taken": False,
+                                "partial_closed_volume": 0.0,
+                                "trail_sl": None,
                             }
                         revenge_update = revenge.on_trade_filled(symbol)
                         if revenge_update is not None:

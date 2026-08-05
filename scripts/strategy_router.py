@@ -20,7 +20,7 @@ class StrategyRouter:
                 use_trend=True,
                 use_candle=True,
                 require_trend_alignment=True,
-                min_score=5,
+                min_score=4,
                 rr=1.5,
                 atr=0.8,
                 fast=5,
@@ -49,8 +49,8 @@ class StrategyRouter:
         }
 
         self.symbol_map = {
-            "EURUSD": "mean_reversion_strict",
-            "GBPUSD": "mean_reversion_strict",
+            "EURUSD": "mean_reversion",
+            "GBPUSD": "mean_reversion",
             "USDJPY": "lion_usdjpy_mirror",
             "USDCHF": "lion_usdchf_actual",
             "XAUUSD": "ftmo_xauusd",

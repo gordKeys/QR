@@ -63,8 +63,8 @@ def main():
         forwarded.extend(["--symbol", item])
     for item in args.data or []:
         forwarded.extend(["--data", item])
-    for item in args.symbols or []:
-        forwarded.extend(["--symbols", item])
+    if args.symbols:
+        forwarded.extend(["--symbols", *args.symbols])
 
     if args.mode == "test":
         print_status(args.mode, args)
@@ -128,7 +128,7 @@ def main():
         if args.hard_drawdown_usd is not None:
             live_args.extend(["--hard-drawdown-usd", str(args.hard_drawdown_usd)])
         if not live_args:
-            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
+            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
         return run_script("live_runner.py", live_args)
 
     return 1

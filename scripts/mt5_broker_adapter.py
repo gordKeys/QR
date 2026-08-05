@@ -242,3 +242,35 @@ class MT5BrokerAdapter:
         if take_profit is not None:
             request["tp"] = self.normalize_price(symbol, take_profit)
         return self.mt5.order_send(request)
+
+    def close_position_partial(self, *, position_ticket, symbol, direction, volume, comment="QuantFX"):
+        order_type = self.mt5.ORDER_TYPE_SELL if direction == 1 else self.mt5.ORDER_TYPE_BUY
+        tick = self.symbol_tick(symbol)
+        if tick is None:
+            return None
+
+        price = tick.bid if direction == 1 else tick.ask
+        request = {
+            "action": self.mt5.TRADE_ACTION_DEAL,
+            "position": int(position_ticket),
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": self.normalize_price(symbol, price),
+            "deviation": 20,
+            "magic": 26072026,
+            "comment": comment,
+            "type_time": self.mt5.ORDER_TIME_GTC,
+        }
+
+        last_result = None
+        invalid_fill = getattr(self.mt5, "TRADE_RETCODE_INVALID_FILL", 10030)
+        for fill_mode in self.filling_modes(symbol):
+            request["type_filling"] = fill_mode
+            last_result = self.mt5.order_send(request)
+            if last_result is not None and getattr(last_result, "retcode", None) == self.mt5.TRADE_RETCODE_DONE:
+                return last_result
+            if last_result is not None and getattr(last_result, "retcode", None) != invalid_fill:
+                break
+
+        return last_result
