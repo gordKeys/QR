@@ -33,6 +33,10 @@ class MT5BrokerAdapter:
         positions = self.mt5.positions_get(symbol=symbol) if symbol else self.mt5.positions_get()
         return 0 if positions is None else len(positions)
 
+    def positions_get(self, symbol=None):
+        positions = self.mt5.positions_get(symbol=symbol) if symbol else self.mt5.positions_get()
+        return [] if positions is None else list(positions)
+
     def symbol_info(self, symbol):
         return self.mt5.symbol_info(symbol)
 
@@ -224,3 +228,17 @@ class MT5BrokerAdapter:
                 break
 
         return last_result
+
+    def modify_position_stops(self, *, position_ticket, symbol, stop_loss=None, take_profit=None, comment="QuantFX"):
+        request = {
+            "action": self.mt5.TRADE_ACTION_SLTP,
+            "position": int(position_ticket),
+            "symbol": symbol,
+            "magic": 26072026,
+            "comment": comment,
+        }
+        if stop_loss is not None:
+            request["sl"] = self.normalize_price(symbol, stop_loss)
+        if take_profit is not None:
+            request["tp"] = self.normalize_price(symbol, take_profit)
+        return self.mt5.order_send(request)

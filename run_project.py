@@ -21,6 +21,8 @@ def print_status(mode, args):
     print(f"Project root: {ROOT}")
     if args.symbol:
         print(f"Symbols: {', '.join(args.symbol)}")
+    elif getattr(args, "symbols", None):
+        print(f"Symbols: {', '.join(args.symbols)}")
     if args.data:
         print(f"Data files: {', '.join(args.data)}")
     if mode == "live":
@@ -38,6 +40,7 @@ def main():
         help="Choose what to run",
     )
     parser.add_argument("--symbol", action="append", help="Repeatable symbol filter")
+    parser.add_argument("--symbols", action="append", help="Repeatable symbol list for mtf/patterns")
     parser.add_argument("--data", action="append", help="Repeatable CSV path filter")
     parser.add_argument("--dry-run", action="store_true", help="Live mode only")
     parser.add_argument("--loop-once", action="store_true", help="Live mode only")
@@ -50,6 +53,9 @@ def main():
     parser.add_argument("--hard-drawdown-usd", type=float, help="Live mode only")
     parser.add_argument("--use-mt5-costs", action="store_true", help="MTF/patterns mode only")
     parser.add_argument("--entry-style", choices=["breakout", "retest"], help="Patterns mode only")
+    parser.add_argument("--strategies", nargs="+", help="Patterns mode only")
+    parser.add_argument("--pattern-timeframe", choices=["15min", "30min", "1h", "4h"], help="Patterns mode only")
+    parser.add_argument("--top-n", type=int, help="Patterns mode only")
     args = parser.parse_args()
 
     forwarded = []
@@ -57,6 +63,8 @@ def main():
         forwarded.extend(["--symbol", item])
     for item in args.data or []:
         forwarded.extend(["--data", item])
+    for item in args.symbols or []:
+        forwarded.extend(["--symbols", item])
 
     if args.mode == "test":
         print_status(args.mode, args)
@@ -86,6 +94,12 @@ def main():
             forwarded.append("--use-mt5-costs")
         if args.entry_style is not None:
             forwarded.extend(["--entry-style", args.entry_style])
+        if args.strategies is not None:
+            forwarded.extend(["--strategies", *args.strategies])
+        if args.pattern_timeframe is not None:
+            forwarded.extend(["--pattern-timeframe", args.pattern_timeframe])
+        if args.top_n is not None:
+            forwarded.extend(["--top-n", str(args.top_n)])
         return run_script("backtest_pattern_playbook.py", forwarded)
 
     if args.mode == "download":
@@ -114,7 +128,7 @@ def main():
         if args.hard_drawdown_usd is not None:
             live_args.extend(["--hard-drawdown-usd", str(args.hard_drawdown_usd)])
         if not live_args:
-            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
         return run_script("live_runner.py", live_args)
 
     return 1

@@ -4,6 +4,8 @@ add_project_root()
 import argparse
 from pathlib import Path
 
+import pandas as pd
+
 from engine.data_loader import DataLoader
 from engine.features import FeatureEngine
 from engine.pattern_backtester import PatternBacktester
@@ -22,18 +24,43 @@ def available_csv_symbols(data_dir):
     return sorted({path.name.split("_")[0].upper() for path in directory.glob("*_M5.csv")})
 
 
-def load_data_for_symbol(symbol, data_dir):
+def load_data_for_symbol(symbol, data_dir, timeframe="1h"):
     loader = DataLoader(symbol=symbol, data_dir=data_dir)
-    return FeatureEngine().add_features(loader.load())
+    frame = loader.load()
+    if frame is None or frame.empty:
+        return frame
+
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        frame = frame.copy()
+        frame.index = pd.to_datetime(frame.index)
+
+    frame = frame.sort_index()
+    frame = frame.resample(timeframe).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "tick_volume": "sum",
+            "spread": "mean",
+            "real_volume": "sum",
+        }
+    ).dropna()
+
+    return FeatureEngine().add_features(frame)
 
 
-def build_strategies(entry_style="breakout"):
-    return {
+def build_strategies(entry_style="breakout", selected=None):
+    registry = {
         "triangle_breakout": PatternPlaybookStrategy(setup_mode="triangles", entry_style=entry_style, higher_timeframe="H4"),
         "head_shoulders": PatternPlaybookStrategy(setup_mode="head_shoulders", entry_style=entry_style, higher_timeframe="H4"),
         "double_triple": PatternPlaybookStrategy(setup_mode="double_triple", entry_style=entry_style, higher_timeframe="H4"),
         "mtf_reversal": PatternPlaybookStrategy(setup_mode="mtf_reversal", entry_style="breakout", higher_timeframe="H4"),
     }
+    if not selected:
+        selected = ["triangle_breakout", "mtf_reversal"]
+    selected_set = {item for item in selected}
+    return {name: strategy for name, strategy in registry.items() if name in selected_set}
 
 
 def summarize_result(result):
@@ -51,6 +78,8 @@ def main():
     parser.add_argument("--swap-short", type=float, default=0.0)
     parser.add_argument("--use-mt5-costs", action="store_true")
     parser.add_argument("--entry-style", choices=["breakout", "retest"], default="breakout")
+    parser.add_argument("--strategies", nargs="+", help="Pattern strategy names to test. Defaults to triangle_breakout mtf_reversal.")
+    parser.add_argument("--pattern-timeframe", choices=["15min", "30min", "1h", "4h"], default="1h")
     parser.add_argument("--top-n", type=int, default=5)
     args = parser.parse_args()
 
@@ -68,7 +97,7 @@ def main():
             print(f"MT5 cost lookup unavailable, using configured defaults: {exc}")
             broker = None
 
-    strategies = build_strategies(entry_style=args.entry_style)
+    strategies = build_strategies(entry_style=args.entry_style, selected=args.strategies)
     rows = []
 
     print("\n=== PATTERN PLAYBOOK BACKTEST ===")
@@ -76,6 +105,8 @@ def main():
     print(f"Available CSV symbols: {', '.join(available) if available else 'none'}")
     print(f"Testing symbols: {', '.join(candidate_symbols)}")
     print(f"Entry style: {args.entry_style}")
+    print(f"Pattern timeframe: {args.pattern_timeframe}")
+    print(f"Strategies: {', '.join(strategies.keys())}")
     print("-" * 108)
 
     for symbol in candidate_symbols:
@@ -83,7 +114,7 @@ def main():
             print(f"{symbol:>8} | skipped (no CSV data)")
             continue
 
-        data = load_data_for_symbol(symbol, args.data_dir)
+        data = load_data_for_symbol(symbol, args.data_dir, timeframe=args.pattern_timeframe)
 
         if broker is not None:
             resolved_symbol = broker.resolve_symbol(symbol)

@@ -140,9 +140,70 @@ def deal_is_stop_loss(deal, broker):
     return deal_profit < 0 and reason is None
 
 
+def position_side(position, broker):
+    buy_type = getattr(broker.mt5, "POSITION_TYPE_BUY", 0)
+    sell_type = getattr(broker.mt5, "POSITION_TYPE_SELL", 1)
+    pos_type = getattr(position, "type", None)
+    if pos_type == buy_type:
+        return 1
+    if pos_type == sell_type:
+        return -1
+    return 0
+
+
+def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
+    info = broker.symbol_info(position.symbol)
+    tick = broker.symbol_tick(position.symbol)
+    if info is None or tick is None:
+        return None
+
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    digits = int(getattr(info, "digits", 2) or 2)
+    contract_size = float(getattr(info, "trade_contract_size", 100000.0) or 100000.0)
+    spread = 0.0
+    if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
+        spread = float(tick.ask - tick.bid)
+
+    commission_price = float(commission_round_turn_per_lot) / max(contract_size, 1.0)
+    safety_buffer = max(point * 2, spread * 0.1)
+    buffer = spread + commission_price + safety_buffer
+    direction = position_side(position, broker)
+    if direction == 1:
+        stop = float(getattr(position, "price_open", 0.0) or 0.0) + buffer
+    elif direction == -1:
+        stop = float(getattr(position, "price_open", 0.0) or 0.0) - buffer
+    else:
+        return None
+
+    return round(stop, digits)
+
+
+def ensure_trade_state(trade_states, position):
+    state = trade_states.get(position.symbol)
+    if state is None or state.get("ticket") != getattr(position, "ticket", None):
+        state = {
+            "ticket": getattr(position, "ticket", None),
+            "mfe_usd": float(getattr(position, "profit", 0.0) or 0.0),
+            "break_even_moved": False,
+            "break_even_sl": None,
+        }
+        trade_states[position.symbol] = state
+    return state
+
+
+def update_trade_mfe(trade_states, position, new_profit):
+    state = ensure_trade_state(trade_states, position)
+    previous = float(state.get("mfe_usd", 0.0) or 0.0)
+    current = float(new_profit or 0.0)
+    if current > previous:
+        state["mfe_usd"] = current
+        return True, state
+    return False, state
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
+    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
@@ -154,6 +215,8 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
+    parser.add_argument("--break-even-trigger-usd", type=float, default=100.0)
+    parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -168,6 +231,7 @@ def main():
     )
     hard_drawdown = HardDrawdownGuard(enabled=args.hard_drawdown_switch, drawdown_usd=args.hard_drawdown_usd)
     symbol_breaker = SymbolCircuitBreaker(max_stop_losses=2)
+    trade_states = {}
     log_dir = ensure_log_dir()
     cooldown_until = None
     last_deal_check = None
@@ -184,6 +248,7 @@ def main():
             f"gap_trades={args.revenge_gap_trades}"
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold=${args.hard_drawdown_usd:.2f}")
+    print(f"Break-even trigger: ${args.break_even_trigger_usd:.2f}")
 
     broker = None
     if not args.dry_run:
@@ -261,19 +326,22 @@ def main():
                     stop_loss_hit = deal_is_stop_loss(deal, broker)
                     revenge_active = revenge.is_active(symbol)
 
-                    if profit != 0:
-                        last_closed_pnl = profit
-                        guard.register_closed_trade(profit)
-                        append_jsonl(
-                            run_log,
-                            {
-                                "event": "closed_deal",
-                                "symbol": symbol,
-                                "profit": profit,
-                                "time": closed_time,
-                                "consecutive_losses": guard.consecutive_losses,
-                            },
-                        )
+                    last_closed_pnl = profit
+                    guard.register_closed_trade(profit)
+                    trade_state = trade_states.pop(symbol, {})
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "closed_deal",
+                            "symbol": symbol,
+                            "profit": profit,
+                            "time": closed_time,
+                            "consecutive_losses": guard.consecutive_losses,
+                            "mfe_usd": trade_state.get("mfe_usd"),
+                            "break_even_moved": trade_state.get("break_even_moved", False),
+                            "break_even_sl": trade_state.get("break_even_sl"),
+                        },
+                    )
 
                     if args.revenge_mode and stop_loss_hit:
                         breaker_state = symbol_breaker.register_close(symbol, stop_loss_hit, revenge_failed=revenge_active)
@@ -349,6 +417,56 @@ def main():
                     append_jsonl(run_log, {"event": "no_data", "symbol": symbol, "time": datetime.now(timezone.utc)})
                     cycle_counts["no_data"] += 1
                     continue
+
+                if broker and not args.dry_run:
+                    positions = broker.positions_get(symbol=symbol)
+                    if positions:
+                        current_position = positions[0]
+                        state = ensure_trade_state(trade_states, current_position)
+                        current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
+                        updated, state = update_trade_mfe(trade_states, current_position, current_profit)
+                        if updated:
+                            append_jsonl(
+                                run_log,
+                                {
+                                    "event": "position_mfe_update",
+                                    "symbol": symbol,
+                                    "ticket": getattr(current_position, "ticket", None),
+                                    "mfe_usd": state["mfe_usd"],
+                                    "current_profit": current_profit,
+                                    "time": started,
+                                },
+                            )
+
+                        if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
+                            break_even_sl = estimate_break_even_stop(
+                                current_position,
+                                broker,
+                                args.break_even_commission_round_turn,
+                            )
+                            if break_even_sl is not None:
+                                result = broker.modify_position_stops(
+                                    position_ticket=getattr(current_position, "ticket", None),
+                                    symbol=symbol,
+                                    stop_loss=break_even_sl,
+                                    take_profit=getattr(current_position, "tp", None),
+                                )
+                                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                                if accepted:
+                                    state["break_even_moved"] = True
+                                    state["break_even_sl"] = break_even_sl
+                                    append_jsonl(
+                                        run_log,
+                                        {
+                                            "event": "break_even_moved",
+                                            "symbol": symbol,
+                                            "ticket": getattr(current_position, "ticket", None),
+                                            "profit_usd": current_profit,
+                                            "new_stop": break_even_sl,
+                                            "mfe_usd": state["mfe_usd"],
+                                            "time": started,
+                                        },
+                                    )
 
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
@@ -531,6 +649,15 @@ def main():
                     accepted = getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                     cycle_counts["orders_sent"] += int(bool(accepted))
                     if accepted:
+                        positions = broker.positions_get(symbol=symbol)
+                        if positions:
+                            current_position = positions[0]
+                            trade_states[symbol] = {
+                                "ticket": getattr(current_position, "ticket", None),
+                                "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
+                                "break_even_moved": False,
+                                "break_even_sl": None,
+                            }
                         revenge_update = revenge.on_trade_filled(symbol)
                         if revenge_update is not None:
                             append_jsonl(

@@ -454,13 +454,17 @@ class PatternPlaybookStrategy(BaseStrategy):
 
         return None
 
-    def _pattern_plan(self, frame: pd.DataFrame, index: int):
+    def _pattern_plan(self, frame: pd.DataFrame, index: int, bias=None):
         current = frame.iloc[index]
         previous = frame.iloc[index - 1]
         if pd.isna(current["atr"]):
             return None
 
-        bias = self._higher_tf_bias(frame).iloc[index]
+        if bias is None:
+            bias = self._higher_tf_bias(frame).iloc[index]
+        elif hasattr(bias, "iloc"):
+            bias = bias.iloc[index]
+
         candidates = []
 
         if self.setup_mode in ("all", "triangles"):
@@ -479,23 +483,27 @@ class PatternPlaybookStrategy(BaseStrategy):
 
     def generate_signals(self, data: pd.DataFrame):
         frame = self._add_indicators(data)
+        bias = self._higher_tf_bias(frame)
         signals = pd.Series(0, index=frame.index)
 
         start = max(self.lookback, self.trend_slow, self.pivot_window * 2) + 2
         for index in range(start, len(frame)):
-            plan = self._pattern_plan(frame, index)
+            plan = self._pattern_plan(frame, index, bias=bias)
             if plan is not None:
                 signals.iloc[index] = int(plan["signal"])
 
         return signals
 
-    def build_trade_plan(self, data: pd.DataFrame, index: int, symbol: str, cost_profile, equity: float):
+    def build_trade_plan(self, data: pd.DataFrame, index: int, symbol: str, cost_profile, equity: float, signal=None, bias=None):
         frame = self._add_indicators(data)
         if index < 2:
             return None
 
-        plan = self._pattern_plan(frame, index)
+        plan = self._pattern_plan(frame, index, bias=bias)
         if plan is None:
+            return None
+
+        if signal is not None and int(plan["signal"]) != int(signal):
             return None
 
         plan["setup"] = self.setup_mode

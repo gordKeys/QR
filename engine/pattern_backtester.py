@@ -90,6 +90,11 @@ class PatternBacktester:
         self.position = None
 
     def run(self):
+        try:
+            signals = self.strategy.generate_signals(self.data)
+        except Exception:
+            signals = pd.Series(0, index=self.data.index)
+
         for index, (timestamp, row) in enumerate(self.data.iterrows()):
             mid_price = float(row["close"])
             spread_points = float(row["spread"]) if "spread" in row and pd.notna(row["spread"]) else 0.0
@@ -117,18 +122,19 @@ class PatternBacktester:
                         exit_price = self._exit_price(self.position.take_profit, -1, spread_points)
                         self._finalize_trade(self.position, timestamp, exit_price, "target")
 
-            signal = 0
+            signal = int(signals.iloc[index]) if index < len(signals) else 0
             plan = None
             if self.position is None:
-                try:
-                    signal_series = self.strategy.generate_signals(self.data.iloc[: index + 1])
-                    signal = int(signal_series.iloc[-1])
-                except Exception:
-                    signal = 0
-
                 if signal != 0 and hasattr(self.strategy, "build_trade_plan"):
                     try:
-                        plan = self.strategy.build_trade_plan(self.data, index, self.symbol, self.cost_profile, self.balance)
+                        plan = self.strategy.build_trade_plan(
+                            self.data,
+                            index,
+                            self.symbol,
+                            self.cost_profile,
+                            self.balance,
+                            signal=signal,
+                        )
                     except TypeError:
                         plan = None
 
