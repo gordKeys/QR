@@ -232,6 +232,14 @@ def spread_filter(symbol, broker, price, atr, max_spread_points=40, max_spread_a
         rule_name = "xauusd"
         max_spread_points = 220
         max_spread_atr_ratio = 0.28
+    elif symbol_name == "GBPUSD":
+        rule_name = "gbpusd"
+        max_spread_points = 70
+        max_spread_atr_ratio = 0.18
+    elif symbol_name == "USDJPY":
+        rule_name = "usdjpy"
+        max_spread_points = 80
+        max_spread_atr_ratio = 0.18
 
     spread = None
     if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
@@ -770,6 +778,7 @@ def main():
                                 "spread": spread_value,
                                 "spread_limit": spread_limit,
                                 "spread_rule": spread_rule,
+                                "message": f"spread too wide under {spread_rule} rule",
                                 "broker_time": broker_time,
                             },
                         )
