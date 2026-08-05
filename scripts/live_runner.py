@@ -12,6 +12,7 @@ from datetime import timedelta
 from engine.data_loader import DataLoader
 from engine.features import FeatureEngine
 from engine.risk_manager import RiskManager
+from engine.symbol_universe import default_cost_profile
 from ftmo_rules import FtmoRules, FtmoRiskGuard
 from strategy_router import StrategyRouter
 from revenge_mode import RevengeTradeManager
@@ -201,7 +202,7 @@ def update_trade_mfe(trade_states, position, new_profit):
     return False, state
 
 
-def higher_timeframe_direction(data, timeframe="1h", ema_span=20):
+def higher_timeframe_direction(data, timeframe="30min", ema_span=20):
     if data is None or data.empty or len(data) < ema_span + 5:
         return None
 
@@ -261,6 +262,64 @@ def spread_filter(symbol, broker, price, atr, max_spread_points=40, max_spread_a
     return spread > allowed, spread, allowed, rule_name
 
 
+def cost_aware_entry_filter(
+    symbol,
+    broker,
+    entry_price,
+    target_price,
+    atr,
+    commission_round_turn_per_lot=7.0,
+    min_cost_to_target_ratio=2.0,
+    data_spread=None,
+):
+    if broker is not None:
+        info = broker.symbol_info(symbol)
+    else:
+        profile = default_cost_profile(symbol)
+        info = type(
+            "CostProfileInfo",
+            (),
+            {
+                "point": profile.point,
+                "trade_contract_size": profile.contract_size,
+            },
+        )()
+
+    if info is None:
+        return False, {}
+
+    tick = broker.symbol_tick(symbol) if broker is not None else None
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    contract_size = float(getattr(info, "trade_contract_size", 100000.0) or 100000.0)
+
+    spread = 0.0
+    if tick is not None and getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
+        spread = float(tick.ask - tick.bid)
+    elif data_spread is not None:
+        spread = float(data_spread)
+
+    commission_price = float(commission_round_turn_per_lot) / max(contract_size, 1.0)
+    safety_buffer = max(point * 10, (atr or 0.0) * 0.05, spread * 0.25)
+    total_cost_distance = spread + commission_price + safety_buffer
+    projected_move = abs(float(target_price) - float(entry_price))
+    net_expected_move = projected_move - total_cost_distance
+    min_required_move = total_cost_distance * float(min_cost_to_target_ratio)
+    min_positive_edge = max(point * 5, (atr or 0.0) * 0.02)
+
+    allowed = projected_move >= min_required_move and net_expected_move >= min_positive_edge
+    details = {
+        "spread": spread,
+        "commission_price": commission_price,
+        "safety_buffer": safety_buffer,
+        "total_cost_distance": total_cost_distance,
+        "projected_move": projected_move,
+        "net_expected_move": net_expected_move,
+        "min_required_move": min_required_move,
+        "min_positive_edge": min_positive_edge,
+    }
+    return allowed, details
+
+
 def structure_stop_from_data(data, symbol, broker, direction, price, atr, lookback=12, buffer_atr=0.35):
     if broker is None:
         return None
@@ -309,6 +368,26 @@ def partial_close_volume(position, broker):
     return close_volume
 
 
+def locked_profit_stop(position, broker, locked_profit_usd, direction):
+    info = broker.symbol_info(position.symbol)
+    if info is None:
+        return None
+
+    entry_price = float(getattr(position, "price_open", 0.0) or 0.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    contract_size = float(getattr(info, "trade_contract_size", 100000.0) or 100000.0)
+    digits = int(getattr(info, "digits", 2) or 2)
+    if entry_price <= 0 or volume <= 0 or contract_size <= 0:
+        return None
+
+    price_offset = float(locked_profit_usd) / (volume * contract_size)
+    if direction == 1:
+        return round(entry_price + price_offset, digits)
+    if direction == -1:
+        return round(entry_price - price_offset, digits)
+    return None
+
+
 def manage_open_position(symbol, data, broker, position, state, args, started, run_log):
     info = broker.symbol_info(symbol)
     tick = broker.symbol_tick(symbol)
@@ -340,6 +419,48 @@ def manage_open_position(symbol, data, broker, position, state, args, started, r
 
     current_stop = float(getattr(position, "sl", 0.0) or 0.0)
     structure_stop = structure_stop_from_data(data, symbol, broker, direction, current_price, float(data["atr"].iloc[-1]), lookback=12)
+
+    current_lock = float(state.get("profit_lock_usd", 0.0) or 0.0)
+    if current_profit >= 100.0:
+        target_lock = 100.0 + (int((current_profit - 100.0) // 50.0) * 50.0)
+        if target_lock > current_lock:
+            base_locked_stop = locked_profit_stop(position, broker, target_lock, direction)
+            if base_locked_stop is not None:
+                buffer_stop = estimate_break_even_stop(position, broker, args.break_even_commission_round_turn)
+                candidate_stop = base_locked_stop
+                if buffer_stop is not None:
+                    candidate_stop = max(candidate_stop, buffer_stop) if direction == 1 else min(candidate_stop, buffer_stop)
+
+                improved = False
+                if direction == 1 and (current_stop <= 0 or candidate_stop > current_stop):
+                    improved = True
+                elif direction == -1 and (current_stop <= 0 or candidate_stop < current_stop):
+                    improved = True
+
+                if improved and candidate_stop is not None:
+                    result = broker.modify_position_stops(
+                        position_ticket=getattr(position, "ticket", None),
+                        symbol=symbol,
+                        stop_loss=candidate_stop,
+                        take_profit=getattr(position, "tp", None),
+                    )
+                    accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                    if accepted:
+                        state["profit_lock_usd"] = target_lock
+                        state["profit_lock_sl"] = candidate_stop
+                        current_stop = candidate_stop
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "profit_lock_moved",
+                                "symbol": symbol,
+                                "ticket": getattr(position, "ticket", None),
+                                "locked_profit_usd": target_lock,
+                                "new_stop": candidate_stop,
+                                "current_profit": current_profit,
+                                "time": started,
+                            },
+                        )
 
     if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
         break_even_sl = estimate_break_even_stop(
@@ -427,10 +548,12 @@ def manage_open_position(symbol, data, broker, position, state, args, started, r
                     },
                 )
 
-    trail_allowed = state.get("partial_taken") or state.get("break_even_moved")
+    trail_allowed = state.get("partial_taken") or state.get("break_even_moved") or current_profit < 0
     if trail_allowed and structure_stop is not None:
         if direction == 1:
             candidate_stop = structure_stop if current_stop <= 0 else max(current_stop, structure_stop)
+            if state.get("profit_lock_sl") is not None:
+                candidate_stop = max(candidate_stop, float(state["profit_lock_sl"]))
             if candidate_stop > 0 and candidate_stop < current_price and candidate_stop > current_stop:
                 result = broker.modify_position_stops(
                     position_ticket=getattr(position, "ticket", None),
@@ -454,6 +577,8 @@ def manage_open_position(symbol, data, broker, position, state, args, started, r
                     )
         elif direction == -1:
             candidate_stop = structure_stop if current_stop <= 0 else min(current_stop, structure_stop)
+            if state.get("profit_lock_sl") is not None:
+                candidate_stop = min(candidate_stop, float(state["profit_lock_sl"]))
             if candidate_stop > current_price and (current_stop <= 0 or candidate_stop < current_stop):
                 result = broker.modify_position_stops(
                     position_ticket=getattr(position, "ticket", None),
@@ -786,37 +911,24 @@ def main():
                         continue
 
                 htf_bias = higher_timeframe_direction(data)
-                if htf_bias is not None:
-                    if signal == 1 and htf_bias == "DOWN":
-                        print(f"{symbol}: skipped because higher timeframe is bearish")
+                htf_multiplier = 1.0
+                if htf_bias is not None and signal != 0:
+                    aligned = (signal == 1 and htf_bias == "UP") or (signal == -1 and htf_bias == "DOWN")
+                    if aligned:
+                        htf_multiplier = 1.0
+                    else:
+                        htf_multiplier = 0.75
                         append_jsonl(
                             run_log,
                             {
-                                "event": "skip",
+                                "event": "htf_soft_bias",
                                 "symbol": symbol,
-                                "reason": "htf_bias_down",
                                 "signal": signal,
                                 "htf_bias": htf_bias,
+                                "multiplier": htf_multiplier,
                                 "broker_time": broker_time,
                             },
                         )
-                        cycle_counts["skip_htf_bias"] += 1
-                        continue
-                    if signal == -1 and htf_bias == "UP":
-                        print(f"{symbol}: skipped because higher timeframe is bullish")
-                        append_jsonl(
-                            run_log,
-                            {
-                                "event": "skip",
-                                "symbol": symbol,
-                                "reason": "htf_bias_up",
-                                "signal": signal,
-                                "htf_bias": htf_bias,
-                                "broker_time": broker_time,
-                            },
-                        )
-                        cycle_counts["skip_htf_bias"] += 1
-                        continue
 
                 if broker and not args.dry_run:
                     tick = broker.symbol_tick(symbol)
@@ -871,6 +983,8 @@ def main():
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
 
+                size_multiplier = revenge_context["multiplier"] * htf_multiplier
+
                 structure_stop = structure_stop_from_data(data, symbol, broker if broker is not None else broker, signal, price, atr)
                 if structure_stop is not None:
                     if signal == 1:
@@ -903,11 +1017,45 @@ def main():
                         stop_price=stop,
                         account_equity=equity,
                         risk_per_trade=rules.max_risk_per_trade_pct,
-                        size_multiplier=revenge_context["multiplier"],
+                        size_multiplier=size_multiplier,
                     )
                 else:
-                    size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
+                    size = risk.calculate_position_size(equity, price, stop, atr=atr) * size_multiplier
                     size_reason = "dry_run"
+
+                data_spread = float(data["spread"].iloc[-1]) if "spread" in data.columns and pd.notna(data["spread"].iloc[-1]) else None
+                cost_allowed, cost_details = cost_aware_entry_filter(
+                    symbol,
+                    broker if broker is not None else None,
+                    price,
+                    target,
+                    atr,
+                    commission_round_turn_per_lot=args.break_even_commission_round_turn,
+                    min_cost_to_target_ratio=2.0,
+                    data_spread=data_spread,
+                )
+                if not cost_allowed:
+                    print(
+                        f"{symbol}: skipped because projected TP does not beat costs "
+                        f"(move={cost_details.get('projected_move', 0.0):.5f}, "
+                        f"cost={cost_details.get('total_cost_distance', 0.0):.5f}, "
+                        f"net={cost_details.get('net_expected_move', 0.0):.5f})"
+                    )
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "skip",
+                            "symbol": symbol,
+                            "reason": "cost_gate",
+                            "projected_move": cost_details.get("projected_move"),
+                            "total_cost_distance": cost_details.get("total_cost_distance"),
+                            "net_expected_move": cost_details.get("net_expected_move"),
+                            "min_required_move": cost_details.get("min_required_move"),
+                            "broker_time": broker_time,
+                        },
+                    )
+                    cycle_counts["skip_cost_gate"] += 1
+                    continue
 
                 if size <= 0:
                     print(f"{symbol}: skipped due to sizing ({size_reason})")
@@ -973,6 +1121,8 @@ def main():
                                 "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
                                 "break_even_moved": False,
                                 "break_even_sl": None,
+                                "profit_lock_usd": 0.0,
+                                "profit_lock_sl": None,
                                 "partial_taken": False,
                                 "partial_closed_volume": 0.0,
                                 "trail_sl": None,
