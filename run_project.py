@@ -40,7 +40,7 @@ def main():
         help="Choose what to run",
     )
     parser.add_argument("--symbol", action="append", help="Repeatable symbol filter")
-    parser.add_argument("--symbols", action="append", help="Repeatable symbol list for mtf/patterns")
+    parser.add_argument("--symbols", nargs="+", action="extend", help="Symbol list for mtf/patterns")
     parser.add_argument("--data", action="append", help="Repeatable CSV path filter")
     parser.add_argument("--dry-run", action="store_true", help="Live mode only")
     parser.add_argument("--loop-once", action="store_true", help="Live mode only")
