@@ -215,7 +215,7 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
-    parser.add_argument("--break-even-trigger-usd", type=float, default=100.0)
+    parser.add_argument("--break-even-trigger-usd", type=float, default=0.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
     args = parser.parse_args()
 
