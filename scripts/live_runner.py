@@ -388,6 +388,18 @@ def locked_profit_stop(position, broker, locked_profit_usd, direction):
     return None
 
 
+def profit_lock_tier(current_profit):
+    if current_profit < 0:
+        return None
+    if current_profit < 25:
+        return 0
+    if current_profit < 100:
+        return int(current_profit // 25) * 25
+    if current_profit < 200:
+        return int(current_profit // 50) * 50
+    return int(current_profit // 50) * 50
+
+
 def manage_open_position(symbol, data, broker, position, state, args, started, run_log):
     info = broker.symbol_info(symbol)
     tick = broker.symbol_tick(symbol)
@@ -420,47 +432,96 @@ def manage_open_position(symbol, data, broker, position, state, args, started, r
     current_stop = float(getattr(position, "sl", 0.0) or 0.0)
     structure_stop = structure_stop_from_data(data, symbol, broker, direction, current_price, float(data["atr"].iloc[-1]), lookback=12)
 
-    current_lock = float(state.get("profit_lock_usd", 0.0) or 0.0)
-    if current_profit >= 100.0:
-        target_lock = 100.0 + (int((current_profit - 100.0) // 50.0) * 50.0)
-        if target_lock > current_lock:
-            base_locked_stop = locked_profit_stop(position, broker, target_lock, direction)
-            if base_locked_stop is not None:
-                buffer_stop = estimate_break_even_stop(position, broker, args.break_even_commission_round_turn)
-                candidate_stop = base_locked_stop
-                if buffer_stop is not None:
-                    candidate_stop = max(candidate_stop, buffer_stop) if direction == 1 else min(candidate_stop, buffer_stop)
-
-                improved = False
-                if direction == 1 and (current_stop <= 0 or candidate_stop > current_stop):
-                    improved = True
-                elif direction == -1 and (current_stop <= 0 or candidate_stop < current_stop):
-                    improved = True
-
-                if improved and candidate_stop is not None:
-                    result = broker.modify_position_stops(
-                        position_ticket=getattr(position, "ticket", None),
-                        symbol=symbol,
-                        stop_loss=candidate_stop,
-                        take_profit=getattr(position, "tp", None),
+    if current_profit > 0 and not state.get("hard_profit_locked"):
+        hard_lock_stop = estimate_break_even_stop(position, broker, args.break_even_commission_round_turn)
+        if hard_lock_stop is not None:
+            if direction == 1 and (current_stop <= 0 or hard_lock_stop > current_stop) and hard_lock_stop < current_price:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=hard_lock_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["hard_profit_locked"] = True
+                    state["hard_profit_lock_sl"] = hard_lock_stop
+                    current_stop = hard_lock_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "hard_profit_lock_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "profit_usd": current_profit,
+                            "new_stop": hard_lock_stop,
+                            "time": started,
+                        },
                     )
-                    accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
-                    if accepted:
-                        state["profit_lock_usd"] = target_lock
-                        state["profit_lock_sl"] = candidate_stop
-                        current_stop = candidate_stop
-                        append_jsonl(
-                            run_log,
-                            {
-                                "event": "profit_lock_moved",
-                                "symbol": symbol,
-                                "ticket": getattr(position, "ticket", None),
-                                "locked_profit_usd": target_lock,
-                                "new_stop": candidate_stop,
-                                "current_profit": current_profit,
-                                "time": started,
-                            },
-                        )
+            elif direction == -1 and (current_stop <= 0 or hard_lock_stop < current_stop) and hard_lock_stop > current_price:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=hard_lock_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["hard_profit_locked"] = True
+                    state["hard_profit_lock_sl"] = hard_lock_stop
+                    current_stop = hard_lock_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "hard_profit_lock_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "profit_usd": current_profit,
+                            "new_stop": hard_lock_stop,
+                            "time": started,
+                        },
+                    )
+
+    current_lock = float(state.get("profit_lock_usd", 0.0) or 0.0)
+    target_lock = profit_lock_tier(current_profit)
+    if target_lock is not None and target_lock > current_lock:
+        base_locked_stop = locked_profit_stop(position, broker, max(target_lock, 0), direction)
+        if base_locked_stop is not None:
+            buffer_stop = estimate_break_even_stop(position, broker, args.break_even_commission_round_turn)
+            candidate_stop = base_locked_stop
+            if buffer_stop is not None:
+                candidate_stop = max(candidate_stop, buffer_stop) if direction == 1 else min(candidate_stop, buffer_stop)
+
+            improved = False
+            if direction == 1 and (current_stop <= 0 or candidate_stop > current_stop):
+                improved = True
+            elif direction == -1 and (current_stop <= 0 or candidate_stop < current_stop):
+                improved = True
+
+            if improved and candidate_stop is not None:
+                result = broker.modify_position_stops(
+                    position_ticket=getattr(position, "ticket", None),
+                    symbol=symbol,
+                    stop_loss=candidate_stop,
+                    take_profit=getattr(position, "tp", None),
+                )
+                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                if accepted:
+                    state["profit_lock_usd"] = target_lock
+                    state["profit_lock_sl"] = candidate_stop
+                    current_stop = candidate_stop
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "profit_lock_moved",
+                            "symbol": symbol,
+                            "ticket": getattr(position, "ticket", None),
+                            "locked_profit_usd": target_lock,
+                            "new_stop": candidate_stop,
+                            "current_profit": current_profit,
+                            "time": started,
+                        },
+                    )
 
     if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
         break_even_sl = estimate_break_even_stop(
@@ -620,6 +681,7 @@ def main():
     parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
     parser.add_argument("--break-even-trigger-usd", type=float, default=190.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
+    parser.add_argument("--profit-lock-delay-minutes", type=float, default=0.0)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -1112,6 +1174,7 @@ def main():
                             contract_size = float(getattr(broker.symbol_info(symbol), "trade_contract_size", 100000.0) or 100000.0)
                             trade_states[symbol] = {
                                 "ticket": getattr(current_position, "ticket", None),
+                                "opened_at": started,
                                 "entry_price": float(getattr(current_position, "price_open", price) or price),
                                 "initial_stop": float(getattr(current_position, "sl", stop) or stop),
                                 "initial_target": float(getattr(current_position, "tp", target) or target),
@@ -1121,6 +1184,8 @@ def main():
                                 "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
                                 "break_even_moved": False,
                                 "break_even_sl": None,
+                                "hard_profit_locked": False,
+                                "hard_profit_lock_sl": None,
                                 "profit_lock_usd": 0.0,
                                 "profit_lock_sl": None,
                                 "partial_taken": False,
