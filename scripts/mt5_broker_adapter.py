@@ -193,7 +193,7 @@ class MT5BrokerAdapter:
             filtered.append(deal)
         return filtered
 
-    def place_order(self, *, symbol, direction, volume, stop_loss, take_profit, price=None, comment="QuantFX"):
+    def place_order(self, *, symbol, direction, volume, stop_loss, take_profit, price=None, comment="QuantFX", magic=26072026):
         order_type = self.mt5.ORDER_TYPE_BUY if direction == 1 else self.mt5.ORDER_TYPE_SELL
         if price is None:
             tick = self.mt5.symbol_info_tick(symbol)
@@ -212,7 +212,7 @@ class MT5BrokerAdapter:
             "sl": stop_loss,
             "tp": take_profit,
             "deviation": 20,
-            "magic": 26072026,
+            "magic": int(magic),
             "comment": comment,
             "type_time": self.mt5.ORDER_TIME_GTC,
         }
@@ -229,12 +229,12 @@ class MT5BrokerAdapter:
 
         return last_result
 
-    def modify_position_stops(self, *, position_ticket, symbol, stop_loss=None, take_profit=None, comment="QuantFX"):
+    def modify_position_stops(self, *, position_ticket, symbol, stop_loss=None, take_profit=None, comment="QuantFX", magic=26072026):
         request = {
             "action": self.mt5.TRADE_ACTION_SLTP,
             "position": int(position_ticket),
             "symbol": symbol,
-            "magic": 26072026,
+            "magic": int(magic),
             "comment": comment,
         }
         if stop_loss is not None:

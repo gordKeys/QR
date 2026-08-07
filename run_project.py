@@ -53,6 +53,25 @@ def main():
     parser.add_argument("--hard-drawdown-usd", type=float, help="Live mode only")
     parser.add_argument("--break-even-trigger-usd", type=float, help="Live mode only")
     parser.add_argument("--break-even-commission-round-turn", type=float, help="Live mode only")
+    parser.add_argument("--news-filter", action="store_true", help="Live mode only")
+    parser.add_argument("--no-news-filter", action="store_true", help="Live mode only")
+    parser.add_argument("--news-before-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-after-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-impact-level", choices=["high", "medium"], help="Live mode only")
+    parser.add_argument("--news-cache-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-calendar-url", type=str, help="Live mode only")
+    parser.add_argument("--news-sniper", action="store_true", help="Live mode only")
+    parser.add_argument("--no-news-sniper", action="store_true", help="Live mode only")
+    parser.add_argument("--news-sniper-symbols", nargs="+", help="Live mode only")
+    parser.add_argument("--news-sniper-magic", type=int, help="Live mode only")
+    parser.add_argument("--news-sniper-risk-pct", type=float, help="Live mode only")
+    parser.add_argument("--news-sniper-rr", type=float, help="Live mode only")
+    parser.add_argument("--news-sniper-post-delay-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-sniper-post-window-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-sniper-lookback-bars", type=int, help="Live mode only")
+    parser.add_argument("--news-sniper-buffer-points", type=float, help="Live mode only")
+    parser.add_argument("--news-sniper-spread-multiplier", type=float, help="Live mode only")
+    parser.add_argument("--news-sniper-min-atr-points", type=float, help="Live mode only")
     parser.add_argument("--use-mt5-costs", action="store_true", help="MTF/patterns mode only")
     parser.add_argument("--entry-style", choices=["breakout", "retest"], help="Patterns mode only")
     parser.add_argument("--strategies", nargs="+", help="Patterns mode only")
@@ -133,6 +152,44 @@ def main():
             live_args.extend(["--break-even-trigger-usd", str(args.break_even_trigger_usd)])
         if args.break_even_commission_round_turn is not None:
             live_args.extend(["--break-even-commission-round-turn", str(args.break_even_commission_round_turn)])
+        if args.news_filter:
+            live_args.append("--news-filter")
+        if args.no_news_filter:
+            live_args.append("--no-news-filter")
+        if args.news_before_minutes is not None:
+            live_args.extend(["--news-before-minutes", str(args.news_before_minutes)])
+        if args.news_after_minutes is not None:
+            live_args.extend(["--news-after-minutes", str(args.news_after_minutes)])
+        if args.news_impact_level is not None:
+            live_args.extend(["--news-impact-level", str(args.news_impact_level)])
+        if args.news_cache_minutes is not None:
+            live_args.extend(["--news-cache-minutes", str(args.news_cache_minutes)])
+        if args.news_calendar_url is not None:
+            live_args.extend(["--news-calendar-url", str(args.news_calendar_url)])
+        if args.news_sniper:
+            live_args.append("--news-sniper")
+        if args.no_news_sniper:
+            live_args.append("--no-news-sniper")
+        if args.news_sniper_symbols is not None:
+            live_args.extend(["--news-sniper-symbols", *args.news_sniper_symbols])
+        if args.news_sniper_magic is not None:
+            live_args.extend(["--news-sniper-magic", str(args.news_sniper_magic)])
+        if args.news_sniper_risk_pct is not None:
+            live_args.extend(["--news-sniper-risk-pct", str(args.news_sniper_risk_pct)])
+        if args.news_sniper_rr is not None:
+            live_args.extend(["--news-sniper-rr", str(args.news_sniper_rr)])
+        if args.news_sniper_post_delay_minutes is not None:
+            live_args.extend(["--news-sniper-post-delay-minutes", str(args.news_sniper_post_delay_minutes)])
+        if args.news_sniper_post_window_minutes is not None:
+            live_args.extend(["--news-sniper-post-window-minutes", str(args.news_sniper_post_window_minutes)])
+        if args.news_sniper_lookback_bars is not None:
+            live_args.extend(["--news-sniper-lookback-bars", str(args.news_sniper_lookback_bars)])
+        if args.news_sniper_buffer_points is not None:
+            live_args.extend(["--news-sniper-buffer-points", str(args.news_sniper_buffer_points)])
+        if args.news_sniper_spread_multiplier is not None:
+            live_args.extend(["--news-sniper-spread-multiplier", str(args.news_sniper_spread_multiplier)])
+        if args.news_sniper_min_atr_points is not None:
+            live_args.extend(["--news-sniper-min-atr-points", str(args.news_sniper_min_atr_points)])
         if not live_args:
             live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
         return run_script("live_runner.py", live_args)

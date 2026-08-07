@@ -16,6 +16,8 @@ from ftmo_rules import FtmoRules, FtmoRiskGuard
 from strategy_router import StrategyRouter
 from revenge_mode import RevengeTradeManager
 from live_protection import HardDrawdownGuard, SymbolCircuitBreaker
+from news_calendar import NewsBlackoutGuard
+from news_trading import NewsSniperModule
 from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
 
@@ -201,6 +203,17 @@ def update_trade_mfe(trade_states, position, new_profit):
     return False, state
 
 
+def spread_policy(symbol: str):
+    symbol = symbol.upper()
+    if symbol in {"EURUSD", "GBPUSD"}:
+        return {"tier": "core", "max_points": 80.0, "atr_ratio": 0.20}
+    if symbol == "USDJPY":
+        return {"tier": "moderate", "max_points": 100.0, "atr_ratio": 0.18}
+    if symbol == "XAUUSD":
+        return {"tier": "aggressive", "max_points": 120.0, "atr_ratio": 0.15}
+    return {"tier": "balanced", "max_points": 90.0, "atr_ratio": 0.18}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
@@ -217,6 +230,29 @@ def main():
     parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
     parser.add_argument("--break-even-trigger-usd", type=float, default=0.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
+    parser.add_argument("--news-filter", action="store_true", default=True)
+    parser.add_argument("--no-news-filter", action="store_false", dest="news_filter")
+    parser.add_argument("--news-before-minutes", type=int, default=30)
+    parser.add_argument("--news-after-minutes", type=int, default=15)
+    parser.add_argument("--news-impact-level", choices=["high", "medium"], default="high")
+    parser.add_argument("--news-cache-minutes", type=int, default=1)
+    parser.add_argument(
+        "--news-calendar-url",
+        type=str,
+        default="https://www.forexfactory.com/calendar?day=today",
+    )
+    parser.add_argument("--news-sniper", action="store_true", default=True)
+    parser.add_argument("--no-news-sniper", action="store_false", dest="news_sniper")
+    parser.add_argument("--news-sniper-symbols", nargs="+")
+    parser.add_argument("--news-sniper-magic", type=int, default=26072027)
+    parser.add_argument("--news-sniper-risk-pct", type=float, default=0.25)
+    parser.add_argument("--news-sniper-rr", type=float, default=1.4)
+    parser.add_argument("--news-sniper-post-delay-minutes", type=int, default=1)
+    parser.add_argument("--news-sniper-post-window-minutes", type=int, default=10)
+    parser.add_argument("--news-sniper-lookback-bars", type=int, default=12)
+    parser.add_argument("--news-sniper-buffer-points", type=float, default=12.0)
+    parser.add_argument("--news-sniper-spread-multiplier", type=float, default=1.25)
+    parser.add_argument("--news-sniper-min-atr-points", type=float, default=8.0)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -231,6 +267,27 @@ def main():
     )
     hard_drawdown = HardDrawdownGuard(enabled=args.hard_drawdown_switch, drawdown_usd=args.hard_drawdown_usd)
     symbol_breaker = SymbolCircuitBreaker(max_stop_losses=2)
+    news_guard = NewsBlackoutGuard(
+        enabled=args.news_filter or args.news_sniper,
+        before_minutes=args.news_before_minutes,
+        after_minutes=args.news_after_minutes,
+        impact_level=args.news_impact_level,
+        calendar_url=args.news_calendar_url,
+        cache_minutes=args.news_cache_minutes,
+    )
+    news_sniper = NewsSniperModule(
+        enabled=args.news_sniper,
+        symbols=args.news_sniper_symbols or ["XAUUSD", "EURUSD", "GBPUSD"],
+        magic=args.news_sniper_magic,
+        risk_pct=args.news_sniper_risk_pct,
+        rr=args.news_sniper_rr,
+        post_delay_minutes=args.news_sniper_post_delay_minutes,
+        post_window_minutes=args.news_sniper_post_window_minutes,
+        lookback_bars=args.news_sniper_lookback_bars,
+        breakout_buffer_points=args.news_sniper_buffer_points,
+        spread_multiplier=args.news_sniper_spread_multiplier,
+        min_atr_points=args.news_sniper_min_atr_points,
+    )
     trade_states = {}
     log_dir = ensure_log_dir()
     cooldown_until = None
@@ -249,6 +306,18 @@ def main():
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold=${args.hard_drawdown_usd:.2f}")
     print(f"Break-even trigger: ${args.break_even_trigger_usd:.2f}")
+    print(
+        "News filter: "
+        f"{'ON' if args.news_filter else 'OFF'} | "
+        f"before={args.news_before_minutes}m | after={args.news_after_minutes}m | "
+        f"impact={args.news_impact_level}"
+    )
+    print(
+        "News sniper: "
+        f"{'ON' if args.news_sniper else 'OFF'} | "
+        f"symbols={', '.join(news_sniper.symbols)} | "
+        f"magic={news_sniper.magic}"
+    )
 
     broker = None
     if not args.dry_run:
@@ -270,6 +339,7 @@ def main():
         run_log, summary_file = date_log_paths(log_dir, current_day)
         print(f"\n=== LIVE CYCLE {started.isoformat()} ===")
         append_jsonl(run_log, {"event": "cycle_start", "time": started})
+        news_guard.refresh(started)
 
         if cooldown_until and started < cooldown_until:
             remaining = cooldown_until - started
@@ -523,11 +593,124 @@ def main():
                         append_jsonl(run_log, {"event": "skip", "symbol": symbol, "reason": "no_tick", "broker_time": broker_time})
                         cycle_counts["skip_no_tick"] += 1
                         continue
+                    policy = spread_policy(symbol)
+                    info = broker.symbol_info(symbol)
+                    point = float(getattr(info, "point", 0.0) or 0.0) if info is not None else 0.0
+                    live_spread = 0.0
+                    if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
+                        live_spread = float(tick.ask - tick.bid)
+                    spread_limit = float(policy["max_points"]) * point if point > 0 else 0.0
+                    atr_limit = float(data["atr"].iloc[-1]) * float(policy["atr_ratio"]) if "atr" in data.columns else 0.0
+                    allowed_spread = max(spread_limit, atr_limit)
+                    if allowed_spread > 0 and live_spread > allowed_spread:
+                        print(
+                            f"{symbol}: skipped because spread is too wide "
+                            f"(spread={live_spread:.5f}, limit={allowed_spread:.5f}, tier={policy['tier']})"
+                        )
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip",
+                                "symbol": symbol,
+                                "reason": "spread_too_wide",
+                                "tier": policy["tier"],
+                                "spread": live_spread,
+                                "spread_limit": allowed_spread,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["skip_wide_spread"] += 1
+                        continue
                     price = float(tick.ask if signal == 1 else tick.bid)
                     equity = broker.account_equity() or rules.initial_balance
                 else:
                     price = float(data["close"].iloc[-1])
                     equity = rules.initial_balance
+
+                news_sniper_plan = news_sniper.maybe_trade(
+                    symbol=symbol,
+                    broker=broker if not args.dry_run else None,
+                    events=news_guard.events(),
+                    now=broker_time,
+                    equity=equity,
+                ) if args.news_sniper and broker and not args.dry_run else None
+                if news_sniper_plan is not None:
+                    result = broker.place_order(
+                        symbol=news_sniper_plan.symbol,
+                        direction=news_sniper_plan.signal,
+                        volume=news_sniper_plan.size,
+                        stop_loss=news_sniper_plan.stop,
+                        take_profit=news_sniper_plan.target,
+                        price=news_sniper_plan.entry,
+                        comment="QuantFX-News",
+                        magic=news_sniper.magic,
+                    )
+                    accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                    event_time = news_sniper_plan.event.event_time
+                    if accepted:
+                        print(
+                            f"{symbol}: NEWS trade placed "
+                            f"event={news_sniper_plan.event.currency} {news_sniper_plan.event.title} "
+                            f"signal={news_sniper_plan.signal} price={news_sniper_plan.entry:.5f} "
+                            f"sl={news_sniper_plan.stop:.5f} tp={news_sniper_plan.target:.5f}"
+                        )
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "news_trade_accepted",
+                                "symbol": symbol,
+                                "magic": news_sniper.magic,
+                                "signal": news_sniper_plan.signal,
+                                "price": news_sniper_plan.entry,
+                                "stop": news_sniper_plan.stop,
+                                "target": news_sniper_plan.target,
+                                "size": news_sniper_plan.size,
+                                "currency": news_sniper_plan.event.currency,
+                                "title": news_sniper_plan.event.title,
+                                "event_time": event_time,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["news_trade_accepted"] += 1
+                        continue
+                    print(
+                        f"{symbol}: NEWS order rejected "
+                        f"event={news_sniper_plan.event.currency} {news_sniper_plan.event.title}"
+                    )
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "news_trade_rejected",
+                            "symbol": symbol,
+                            "magic": news_sniper.magic,
+                            "currency": news_sniper_plan.event.currency,
+                            "title": news_sniper_plan.event.title,
+                            "result": str(result),
+                            "broker_time": broker_time,
+                        },
+                    )
+
+                news_blocked, blocked_event = news_guard.should_block(symbol, broker_time)
+                if news_blocked and blocked_event is not None:
+                    print(
+                        f"{symbol}: skipped because of news blackout "
+                        f"({blocked_event.currency} {blocked_event.title} at {blocked_event.event_time.isoformat()})"
+                    )
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "skip",
+                            "symbol": symbol,
+                            "reason": "news_blackout",
+                            "currency": blocked_event.currency,
+                            "title": blocked_event.title,
+                            "event_time": blocked_event.event_time,
+                            "impact": blocked_event.impact,
+                            "broker_time": broker_time,
+                        },
+                    )
+                    cycle_counts["skip_news_blackout"] += 1
+                    continue
 
                 if signal == 0:
                     print(f"{symbol}: no trade (no_signal)")
