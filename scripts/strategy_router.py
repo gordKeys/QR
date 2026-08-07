@@ -2,6 +2,7 @@ from strategies.mean_reversion import MeanReversion
 from strategies.lion_of_judah import LionOfJudahFiveSignalStrategy
 from strategies.momentum import Momentum
 from strategies.ftmo_xauusd import FTMOXAUUSD
+from strategies.fast_price_action import build_fast_price_action_registry
 from strategies.trend_follow import TrendFollowing
 from strategies.volatility_breakout import VolatilityBreakout
 
@@ -47,6 +48,7 @@ class StrategyRouter:
                 strategy_name="five_signal_confluence_scalper_strict",
             ),
         }
+        self.registry.update(build_fast_price_action_registry())
 
         self.symbol_map = {
             "EURUSD": "mean_reversion_strict",

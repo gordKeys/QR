@@ -253,9 +253,13 @@ def main():
     parser.add_argument("--news-sniper-buffer-points", type=float, default=12.0)
     parser.add_argument("--news-sniper-spread-multiplier", type=float, default=1.25)
     parser.add_argument("--news-sniper-min-atr-points", type=float, default=8.0)
+    parser.add_argument("--use-fast-price-action", action="store_true")
     args = parser.parse_args()
 
     router = StrategyRouter()
+    if args.use_fast_price_action:
+        router.update_mapping("XAUUSD", "mtf_pa_breakout")
+        router.update_mapping("GBPUSD", "pattern_playbook_double_triple")
     rules = FtmoRules(initial_balance=10000, max_consecutive_losses=args.max_consecutive_losses)
     guard = FtmoRiskGuard(rules)
     risk = RiskManager(risk_per_trade=rules.max_risk_per_trade_pct)
@@ -729,8 +733,31 @@ def main():
                     continue
 
                 strategy_plan = None
+                build_trade_plan = getattr(strategy, "build_trade_plan", None)
+                if callable(build_trade_plan):
+                    try:
+                        strategy_plan = build_trade_plan(
+                            data,
+                            len(data) - 1,
+                            symbol,
+                            None,
+                            equity,
+                            signal=signal,
+                        )
+                    except TypeError:
+                        try:
+                            strategy_plan = build_trade_plan(
+                                data,
+                                len(data) - 1,
+                                symbol,
+                                None,
+                                equity,
+                            )
+                        except TypeError:
+                            strategy_plan = None
+
                 analyze_trade = getattr(strategy, "analyze_trade", None)
-                if callable(analyze_trade):
+                if strategy_plan is None and callable(analyze_trade):
                     try:
                         strategy_plan = analyze_trade(
                             data,

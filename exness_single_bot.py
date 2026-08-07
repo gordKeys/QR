@@ -26,6 +26,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from strategies.fast_price_action import build_fast_price_action_registry
+
 try:
     import MetaTrader5 as mt5  # type: ignore
 except Exception as exc:  # pragma: no cover - import guard for local syntax checks
@@ -535,12 +537,13 @@ class StrategyRouter:
                 mirror=False,
             ),
         }
+        self.registry.update(build_fast_price_action_registry())
         self.symbol_map = {
             "EURUSD": "mean_reversion_strict",
-            "GBPUSD": "mean_reversion_strict",
+            "GBPUSD": "pattern_playbook_double_triple",
             "USDJPY": "lion_usdjpy_mirror",
             "USDCHF": "lion_usdchf_actual",
-            "XAUUSD": "ftmo_xauusd",
+            "XAUUSD": "mtf_pa_breakout",
         }
         self.default_strategy = "mean_reversion"
 
@@ -772,8 +775,28 @@ class ExnessMT5Bot:
 
     def build_trade_plan(self, symbol: str, data: pd.DataFrame, signal: int, price: float, strategy: BaseStrategy) -> Optional[TradePlan]:
         if hasattr(strategy, "build_trade_plan"):
-            current = strategy.add_indicators(data).iloc[-1]
-            return strategy.build_trade_plan(self, symbol, self.equity, signal, price, current)
+            try:
+                plan = strategy.build_trade_plan(data, len(data) - 1, symbol, None, self.equity, signal=signal)
+            except TypeError:
+                try:
+                    plan = strategy.build_trade_plan(data, len(data) - 1, symbol, None, self.equity)
+                except TypeError:
+                    plan = None
+
+            if plan is None:
+                return None
+
+            if isinstance(plan, TradePlan):
+                return plan
+
+            return TradePlan(
+                signal=int(plan.get("signal", signal)),
+                price=float(plan.get("price", price)),
+                stop=float(plan.get("stop")),
+                target=float(plan.get("target")),
+                size=float(plan.get("size", 0.0)),
+                reason=str(plan.get("size_reason", "strategy_plan")),
+            )
 
         current_atr = float(data["atr"].iloc[-1])
         if current_atr <= 0:

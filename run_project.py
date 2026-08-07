@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--news-sniper-buffer-points", type=float, help="Live mode only")
     parser.add_argument("--news-sniper-spread-multiplier", type=float, help="Live mode only")
     parser.add_argument("--news-sniper-min-atr-points", type=float, help="Live mode only")
+    parser.add_argument("--use-fast-price-action", action="store_true", help="Live mode only")
     parser.add_argument("--use-mt5-costs", action="store_true", help="MTF/patterns mode only")
     parser.add_argument("--entry-style", choices=["breakout", "retest"], help="Patterns mode only")
     parser.add_argument("--strategies", nargs="+", help="Patterns mode only")
@@ -190,6 +191,8 @@ def main():
             live_args.extend(["--news-sniper-spread-multiplier", str(args.news_sniper_spread_multiplier)])
         if args.news_sniper_min_atr_points is not None:
             live_args.extend(["--news-sniper-min-atr-points", str(args.news_sniper_min_atr_points)])
+        if args.use_fast_price_action:
+            live_args.append("--use-fast-price-action")
         if not live_args:
             live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
         return run_script("live_runner.py", live_args)
