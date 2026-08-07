@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import json
+from html import unescape
 import re
+from html.parser import HTMLParser
 from typing import Iterable
 
 import requests
-from bs4 import BeautifulSoup
 
 
 HIGH_IMPACT_KEYWORDS = (
@@ -46,6 +47,12 @@ HIGH_IMPACT_KEYWORDS = (
 TIME_RE = re.compile(r"^(?:\d{1,2}:\d{2}(?:am|pm)|All Day)$", re.IGNORECASE)
 DATE_RE = re.compile(r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Z][a-z]{2}\s+\d{1,2}$")
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+TABLE_RE = re.compile(r"<table\b.*?>.*?</table>", re.IGNORECASE | re.DOTALL)
+ROW_RE = re.compile(r"<tr\b.*?>.*?</tr>", re.IGNORECASE | re.DOTALL)
+CELL_RE = re.compile(r"<t[dh]\b(.*?)>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
+ATTR_RE = re.compile(r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"(.*?)"')
+IMG_RE = re.compile(r"<img\b(.*?)/?>", re.IGNORECASE | re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,31 @@ class NewsEvent:
         if "high" in impact_text:
             return True
         return any(keyword in title_text for keyword in HIGH_IMPACT_KEYWORDS)
+
+
+def strip_tags(value: str) -> str:
+    return unescape(TAG_RE.sub(" ", value or "")).replace("\xa0", " ").strip()
+
+
+def parse_attrs(fragment: str) -> dict[str, str]:
+    return {key.lower(): unescape(val) for key, val in ATTR_RE.findall(fragment or "")}
+
+
+def extract_tables(html_text: str) -> list[str]:
+    return TABLE_RE.findall(html_text or "")
+
+
+def extract_rows(table_html: str) -> list[str]:
+    return ROW_RE.findall(table_html or "")
+
+
+def extract_cells(row_html: str) -> list[tuple[str, dict[str, str], list[dict[str, str]]]]:
+    cells = []
+    for attrs_text, cell_html in CELL_RE.findall(row_html or ""):
+        attrs = parse_attrs(attrs_text)
+        images = [parse_attrs(match) for match in IMG_RE.findall(cell_html or "")]
+        cells.append((strip_tags(cell_html), attrs, images))
+    return cells
 
 
 class ForexFactoryNewsClient:
@@ -109,22 +141,18 @@ class ForexFactoryNewsClient:
 
     @staticmethod
     def _row_cells(row):
-        cells = []
-        for cell in row.find_all(["td", "th"]):
-            text = cell.get_text(" ", strip=True)
-            cells.append((text, cell))
-        return cells
+        return extract_cells(row)
 
     @staticmethod
     def _row_impact(row_cell_nodes) -> str:
-        for _, cell in row_cell_nodes:
-            for image in cell.find_all("img"):
+        for _, _, images in row_cell_nodes:
+            for image in images:
                 candidate = " ".join(
                     part
                     for part in (
                         image.get("alt"),
                         image.get("title"),
-                        " ".join(image.get("class", [])) if image.get("class") else None,
+                        image.get("class"),
                         image.get("src"),
                     )
                     if part
@@ -140,8 +168,8 @@ class ForexFactoryNewsClient:
     def fetch_events(self) -> list[NewsEvent]:
         response = self.session.get(self.calendar_url, timeout=self.timeout_seconds)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "lxml")
-        page_text = soup.get_text(" ", strip=True)
+        page_html = response.text
+        page_text = strip_tags(page_html)
 
         timezone_match = re.search(r"Calendar Time Zone:\s*([A-Za-z0-9_/\-+ ]+)", page_text)
         calendar_timezone_name = timezone_match.group(1).strip() if timezone_match else "UTC"
@@ -153,21 +181,17 @@ class ForexFactoryNewsClient:
             calendar_timezone = timezone.utc
 
         reference_year = datetime.now(calendar_timezone).year
-        event_tables = []
-        for table in soup.find_all("table"):
-            table_text = table.get_text(" ", strip=True)
-            if "Currency" in table_text and "Detail" in table_text:
-                event_tables.append(table)
+        event_tables = [table for table in extract_tables(page_html) if "Currency" in strip_tags(table) and "Detail" in strip_tags(table)]
 
         events: list[NewsEvent] = []
         for table in event_tables:
             current_date_label = None
-            for row in table.find_all("tr"):
+            for row in extract_rows(table):
                 row_cells = self._row_cells(row)
                 if not row_cells:
                     continue
 
-                row_text = " ".join(text for text, _ in row_cells if text)
+                row_text = " ".join(text for text, _, _ in row_cells if text)
                 if DATE_RE.match(row_text):
                     current_date_label = row_text
                     continue
@@ -177,7 +201,7 @@ class ForexFactoryNewsClient:
 
                 currency_index = None
                 time_index = None
-                for index, (text, _) in enumerate(row_cells):
+                for index, (text, _, _) in enumerate(row_cells):
                     if currency_index is None and CURRENCY_RE.match(text):
                         currency_index = index
                     elif time_index is None and TIME_RE.match(text):
@@ -204,7 +228,7 @@ class ForexFactoryNewsClient:
 
                 impact = self._row_impact(row_cells)
                 actual = forecast = previous = None
-                numeric_cells = [text for text, _ in row_cells if text and text not in {current_date_label, time_label, currency, title}]
+                numeric_cells = [text for text, _, _ in row_cells if text and text not in {current_date_label, time_label, currency, title}]
                 if len(numeric_cells) >= 2:
                     actual = numeric_cells[-3] if len(numeric_cells) >= 3 else None
                     forecast = numeric_cells[-2] if len(numeric_cells) >= 2 else None
