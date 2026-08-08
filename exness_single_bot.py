@@ -11,9 +11,9 @@ from __future__ import annotations
 
 # Fill these in once if you want to run the bot without command-line args.
 # Leave them as None / placeholders if you prefer env vars or CLI overrides.
-EXNESS_LOGIN = None  # e.g. 12345678
-EXNESS_PASSWORD = None  # e.g. "your_password"
-EXNESS_SERVER = None  # e.g. "Exness-MT5"
+EXNESS_LOGIN = 173186259  # e.g. 12345678
+EXNESS_PASSWORD = "Gordonpap@2023"  # e.g. "your_password"
+EXNESS_SERVER = "Exness-MT5Real"  # e.g. "Exness-MT5"
 
 import argparse
 import os
