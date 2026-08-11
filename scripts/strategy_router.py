@@ -1,6 +1,7 @@
 from strategies.mean_reversion import MeanReversion
 from strategies.lion_of_judah import LionOfJudahFiveSignalStrategy
 from strategies.momentum import Momentum
+from strategies.audusd_confluence import AUDUSDConfluenceStrategy
 from strategies.ftmo_xauusd import FTMOXAUUSD
 from strategies.trend_follow import TrendFollowing
 from strategies.volatility_breakout import VolatilityBreakout
@@ -16,6 +17,7 @@ class StrategyRouter:
             "trend": TrendFollowing(),
             "volatility_breakout": VolatilityBreakout(),
             "ftmo_xauusd": FTMOXAUUSD(min_score=4),
+            "audusd_confluence": AUDUSDConfluenceStrategy(min_score=3),
             "lion_usdjpy_mirror": LionOfJudahFiveSignalStrategy(
                 use_trend=True,
                 use_candle=True,
@@ -51,6 +53,7 @@ class StrategyRouter:
         self.symbol_map = {
             "EURUSD": "mean_reversion_strict",
             "GBPUSD": "mean_reversion_strict",
+            "AUDUSD": "audusd_confluence",
             "USDJPY": "lion_usdjpy_mirror",
             "USDCHF": "lion_usdchf_actual",
             "XAUUSD": "ftmo_xauusd",

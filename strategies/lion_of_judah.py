@@ -20,6 +20,7 @@ class LionOfJudahFiveSignalStrategy(BaseStrategy):
         ob=68,
         os=32,
         mirror=False,
+        trend_timeframe="15min",
         strategy_name="lion_of_judah",
     ):
         self.use_trend = use_trend
@@ -34,6 +35,7 @@ class LionOfJudahFiveSignalStrategy(BaseStrategy):
         self.ob = ob
         self.os = os
         self.mirror = mirror
+        self.trend_timeframe = trend_timeframe
         self.strategy_name = strategy_name
 
     def _add_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -107,14 +109,14 @@ class LionOfJudahFiveSignalStrategy(BaseStrategy):
         if len(data) < 70:
             return None
 
-        hourly = data[["open", "high", "low", "close", "tick_volume"]].resample("1h").agg(
+        trend_frame = data[["open", "high", "low", "close", "tick_volume"]].resample(self.trend_timeframe).agg(
             {"open": "first", "high": "max", "low": "min", "close": "last", "tick_volume": "sum"}
         ).dropna()
-        if len(hourly) < 20:
+        if len(trend_frame) < 20:
             return None
 
-        ema = hourly["close"].ewm(span=20, adjust=False).mean()
-        return "UP" if hourly["close"].iloc[-1] > ema.iloc[-1] else "DOWN"
+        ema = trend_frame["close"].ewm(span=20, adjust=False).mean()
+        return "UP" if trend_frame["close"].iloc[-1] > ema.iloc[-1] else "DOWN"
 
     def _score_signals(self, current, previous, trend):
         volume_ok = current["vol_avg"] > 0 and current["vol"] >= current["vol_avg"] * 1.05
