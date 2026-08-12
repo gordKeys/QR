@@ -3,9 +3,9 @@ from collections import defaultdict
 
 class HardDrawdownGuard:
 
-    def __init__(self, enabled=False, drawdown_usd=3000.0):
+    def __init__(self, enabled=False, drawdown_pct=10.0):
         self.enabled = enabled
-        self.drawdown_usd = float(drawdown_usd)
+        self.drawdown_pct = float(drawdown_pct)
         self.start_equity = None
         self.day_start_equity = None
         self.triggered = False
@@ -33,13 +33,15 @@ class HardDrawdownGuard:
 
         total_drawdown = self.start_equity - equity
         daily_drawdown = self.day_start_equity - equity
+        total_limit = self.start_equity * (self.drawdown_pct / 100.0)
+        daily_limit = self.day_start_equity * (self.drawdown_pct / 100.0)
 
-        if total_drawdown >= self.drawdown_usd:
+        if total_drawdown >= total_limit:
             self.triggered = True
             self.reason = f"total_drawdown_{total_drawdown:.2f}"
             return True
 
-        if daily_drawdown >= self.drawdown_usd:
+        if daily_drawdown >= daily_limit:
             self.triggered = True
             self.reason = f"daily_drawdown_{daily_drawdown:.2f}"
             return True

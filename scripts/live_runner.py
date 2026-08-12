@@ -239,8 +239,8 @@ def main():
     parser.add_argument("--revenge-gap-trades", type=int, default=2)
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
-    parser.add_argument("--hard-drawdown-usd", type=float, default=3000.0)
-    parser.add_argument("--break-even-trigger-usd", type=float, default=100.0)
+    parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
+    parser.add_argument("--break-even-trigger-pct", type=float, default=1.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
     args = parser.parse_args()
 
@@ -254,7 +254,7 @@ def main():
         boosts_total=args.revenge_boosts,
         normal_gap=args.revenge_gap_trades,
     )
-    hard_drawdown = HardDrawdownGuard(enabled=args.hard_drawdown_switch, drawdown_usd=args.hard_drawdown_usd)
+    hard_drawdown = HardDrawdownGuard(enabled=args.hard_drawdown_switch, drawdown_pct=args.hard_drawdown_pct)
     symbol_breaker = SymbolCircuitBreaker(max_stop_losses=2)
     trade_states = {}
     log_dir = ensure_log_dir()
@@ -263,6 +263,7 @@ def main():
     last_closed_pnl = None
     active_positions = 0
     hard_drawdown_day = None
+    reference_balance = rules.initial_balance
 
     print(f"Revenge mode: {'ON' if args.revenge_mode else 'OFF'}")
     if args.revenge_mode:
@@ -272,8 +273,8 @@ def main():
             f"boosts={args.revenge_boosts}, "
             f"gap_trades={args.revenge_gap_trades}"
         )
-    print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold=${args.hard_drawdown_usd:.2f}")
-    print(f"Break-even trigger: ${args.break_even_trigger_usd:.2f}")
+    print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
+    print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
 
     broker = None
     if not args.dry_run:
@@ -284,6 +285,7 @@ def main():
             live_equity = broker.account_equity()
             if live_equity is not None:
                 hard_drawdown.reset_session(live_equity)
+                reference_balance = live_equity
         except MT5UnavailableError as exc:
             print(f"MT5 unavailable, falling back to dry-run: {exc}")
             args.dry_run = True
@@ -338,6 +340,13 @@ def main():
                         "hard_drawdown_triggered": hard_drawdown.triggered,
                         "hard_drawdown_reason": hard_drawdown.reason,
                     },
+                )
+                session_pnl = current_equity - reference_balance
+                pnl_pct = (session_pnl / reference_balance * 100.0) if reference_balance else 0.0
+                print(
+                    f"ACCOUNT | balance=${current_equity:.2f} | "
+                    f"PnL=${session_pnl:+.2f} ({pnl_pct:+.2f}%) | "
+                    f"ref_balance=${reference_balance:.2f}"
                 )
 
         live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
@@ -469,7 +478,8 @@ def main():
                                 },
                             )
 
-                        if not state.get("break_even_moved") and current_profit >= args.break_even_trigger_usd:
+                        break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
+                        if not state.get("break_even_moved") and current_profit >= break_even_trigger:
                             break_even_sl = estimate_break_even_stop(
                                 current_position,
                                 broker,
@@ -493,6 +503,8 @@ def main():
                                             "symbol": symbol,
                                             "ticket": getattr(current_position, "ticket", None),
                                             "profit_usd": current_profit,
+                                            "break_even_trigger_usd": break_even_trigger,
+                                            "break_even_trigger_pct": args.break_even_trigger_pct,
                                             "new_stop": break_even_sl,
                                             "mfe_usd": state["mfe_usd"],
                                             "time": started,
