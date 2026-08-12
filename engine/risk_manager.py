@@ -2,9 +2,9 @@ class RiskManager:
 
     def __init__(
         self,
-        risk_per_trade=0.05,       # 5%
-        max_daily_loss=0.05,
-        max_drawdown=0.10
+        risk_per_trade=0.2,       # 5%
+        max_daily_loss=0.3,
+        max_drawdown=0.20
     ):
 
         self.risk_per_trade = risk_per_trade
