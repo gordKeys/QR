@@ -42,6 +42,30 @@ def latest_signal(symbol, data, router):
     return int(signal_series.iloc[-1]), strategy
 
 
+def resolve_live_symbol(broker, symbol, dry_run):
+    if dry_run or broker is None:
+        return symbol.upper()
+    resolved_symbol = broker.resolve_symbol(symbol)
+    return resolved_symbol or symbol.upper()
+
+
+def build_live_symbol_context(symbols, broker, dry_run):
+    context = []
+    alias_map = {}
+    for symbol in symbols:
+        canonical_symbol = symbol.upper()
+        broker_symbol = resolve_live_symbol(broker, canonical_symbol, dry_run)
+        context.append(
+            {
+                "symbol": canonical_symbol,
+                "broker_symbol": broker_symbol,
+            }
+        )
+        alias_map[broker_symbol.upper()] = canonical_symbol
+        alias_map[canonical_symbol.upper()] = canonical_symbol
+    return context, alias_map
+
+
 def ensure_log_dir():
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -178,8 +202,9 @@ def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
     return round(stop, digits)
 
 
-def ensure_trade_state(trade_states, position):
-    state = trade_states.get(position.symbol)
+def ensure_trade_state(trade_states, position, state_key=None):
+    key = state_key or position.symbol
+    state = trade_states.get(key)
     if state is None or state.get("ticket") != getattr(position, "ticket", None):
         state = {
             "ticket": getattr(position, "ticket", None),
@@ -187,12 +212,12 @@ def ensure_trade_state(trade_states, position):
             "break_even_moved": False,
             "break_even_sl": None,
         }
-        trade_states[position.symbol] = state
+        trade_states[key] = state
     return state
 
 
-def update_trade_mfe(trade_states, position, new_profit):
-    state = ensure_trade_state(trade_states, position)
+def update_trade_mfe(trade_states, position, new_profit, state_key=None):
+    state = ensure_trade_state(trade_states, position, state_key=state_key)
     previous = float(state.get("mfe_usd", 0.0) or 0.0)
     current = float(new_profit or 0.0)
     if current > previous:
@@ -315,6 +340,8 @@ def main():
                     },
                 )
 
+        live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
+
         if broker and not args.dry_run and last_deal_check is not None:
             closed_deals = broker.history_deals_since(last_deal_check, magic=26072026)
             last_deal_check = started
@@ -322,7 +349,8 @@ def main():
                 for deal in sorted(closed_deals, key=lambda item: getattr(item, "time", started)):
                     profit = float(getattr(deal, "profit", 0.0) or 0.0)
                     closed_time = getattr(deal, "time", started)
-                    symbol = getattr(deal, "symbol", "")
+                    broker_symbol = getattr(deal, "symbol", "")
+                    symbol = symbol_aliases.get(str(broker_symbol).upper(), str(broker_symbol).upper())
                     stop_loss_hit = deal_is_stop_loss(deal, broker)
                     revenge_active = revenge.is_active(symbol)
 
@@ -408,10 +436,13 @@ def main():
                     time.sleep(sleep_for)
                     continue
 
-        for symbol in args.symbols:
+        for symbol_ctx in live_symbols:
+            symbol = symbol_ctx["symbol"]
+            broker_symbol = symbol_ctx["broker_symbol"]
+
             print(format_status(symbol, guard.consecutive_losses, cooldown_until, last_closed_pnl))
             with timed(f"{symbol} evaluation"):
-                data = build_data_for_symbol(symbol, broker=broker if not args.dry_run else None)
+                data = build_data_for_symbol(broker_symbol, broker=broker if not args.dry_run else None)
                 if data is None or data.empty:
                     print(f"{symbol}: no data available")
                     append_jsonl(run_log, {"event": "no_data", "symbol": symbol, "time": datetime.now(timezone.utc)})
@@ -419,12 +450,12 @@ def main():
                     continue
 
                 if broker and not args.dry_run:
-                    positions = broker.positions_get(symbol=symbol)
+                    positions = broker.positions_get(symbol=broker_symbol)
                     if positions:
                         current_position = positions[0]
-                        state = ensure_trade_state(trade_states, current_position)
+                        state = ensure_trade_state(trade_states, current_position, state_key=symbol)
                         current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
-                        updated, state = update_trade_mfe(trade_states, current_position, current_profit)
+                        updated, state = update_trade_mfe(trade_states, current_position, current_profit, state_key=symbol)
                         if updated:
                             append_jsonl(
                                 run_log,
@@ -517,7 +548,7 @@ def main():
                 broker_time = data.index[-1].to_pydatetime()
 
                 if broker and not args.dry_run:
-                    tick = broker.symbol_tick(symbol)
+                    tick = broker.symbol_tick(broker_symbol)
                     if tick is None:
                         print(f"{symbol}: no live tick available")
                         append_jsonl(run_log, {"event": "skip", "symbol": symbol, "reason": "no_tick", "broker_time": broker_time})
@@ -552,7 +583,7 @@ def main():
                         strategy_plan = analyze_trade(
                             data,
                             broker=broker if not args.dry_run else None,
-                            symbol=symbol,
+                            symbol=broker_symbol,
                             equity=equity,
                             signal=signal,
                             price=price,
@@ -571,7 +602,7 @@ def main():
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
 
                     if broker and not args.dry_run:
-                        stop, target = broker.conform_stop_levels(symbol, signal, price, stop, target)
+                        stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
                         if stop is None or target is None:
                             print(f"{symbol}: skipped because broker stop levels are invalid")
                             cycle_counts["skip_invalid_stops"] += 1
@@ -588,7 +619,7 @@ def main():
                             continue
                         size, size_reason = calculate_trade_volume(
                             broker=broker,
-                            symbol=symbol,
+                            symbol=broker_symbol,
                             direction=signal,
                             entry_price=price,
                             stop_price=stop,
@@ -638,7 +669,7 @@ def main():
                         cycle_counts["skip_open_position"] += 1
                         continue
                     result = broker.place_order(
-                        symbol=symbol,
+                        symbol=broker_symbol,
                         direction=signal,
                         volume=size,
                         stop_loss=stop,
@@ -649,7 +680,7 @@ def main():
                     accepted = getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                     cycle_counts["orders_sent"] += int(bool(accepted))
                     if accepted:
-                        positions = broker.positions_get(symbol=symbol)
+                        positions = broker.positions_get(symbol=broker_symbol)
                         if positions:
                             current_position = positions[0]
                             trade_states[symbol] = {
