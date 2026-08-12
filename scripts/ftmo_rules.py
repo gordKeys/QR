@@ -5,7 +5,7 @@ class FtmoRules:
         initial_balance=10000,
         max_daily_loss_pct=0.05,
         max_total_loss_pct=0.10,
-        max_risk_per_trade_pct=0.005,
+        max_risk_per_trade_pct=0.05,
         max_open_positions=1,
         max_consecutive_losses=3,
     ):
