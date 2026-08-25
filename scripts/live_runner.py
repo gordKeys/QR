@@ -420,11 +420,14 @@ def main():
                     f"ref_balance=${reference_balance:.2f}"
                 )
                 if compliance is not None:
-                    report = compliance.refresh_account(
+                    compliance.refresh_account(
                         balance=current_balance,
                         equity=current_equity,
                         now_utc=started,
                     )
+                    report = compliance.current_report()
+                    if report is None:
+                        continue
                     countdown = format_countdown(report.get("seconds_to_reset"))
                     print(
                         f"FTMO | Prague={report['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
