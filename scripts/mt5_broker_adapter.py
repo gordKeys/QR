@@ -242,3 +242,46 @@ class MT5BrokerAdapter:
         if take_profit is not None:
             request["tp"] = self.normalize_price(symbol, take_profit)
         return self.mt5.order_send(request)
+
+    def close_position(self, position, *, comment="QuantFX close"):
+        tick = self.symbol_tick(position.symbol)
+        if tick is None:
+            return None
+
+        direction = getattr(position, "type", None)
+        buy_type = getattr(self.mt5, "POSITION_TYPE_BUY", 0)
+        sell_type = getattr(self.mt5, "POSITION_TYPE_SELL", 1)
+
+        if direction == buy_type:
+            close_type = self.mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        elif direction == sell_type:
+            close_type = self.mt5.ORDER_TYPE_BUY
+            price = tick.ask
+        else:
+            return None
+
+        request = {
+            "action": self.mt5.TRADE_ACTION_DEAL,
+            "position": int(getattr(position, "ticket", 0) or 0),
+            "symbol": position.symbol,
+            "volume": float(getattr(position, "volume", 0.0) or 0.0),
+            "type": close_type,
+            "price": self.normalize_price(position.symbol, price),
+            "deviation": 20,
+            "magic": int(getattr(position, "magic", 26072026) or 26072026),
+            "comment": comment,
+            "type_time": self.mt5.ORDER_TIME_GTC,
+        }
+
+        last_result = None
+        invalid_fill = getattr(self.mt5, "TRADE_RETCODE_INVALID_FILL", 10030)
+        for fill_mode in self.filling_modes(position.symbol):
+            request["type_filling"] = fill_mode
+            last_result = self.mt5.order_send(request)
+            if last_result is not None and getattr(last_result, "retcode", None) == self.mt5.TRADE_RETCODE_DONE:
+                return last_result
+            if last_result is not None and getattr(last_result, "retcode", None) != invalid_fill:
+                break
+
+        return last_result

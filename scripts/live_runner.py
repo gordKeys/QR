@@ -16,8 +16,16 @@ from ftmo_rules import FtmoRules, FtmoRiskGuard
 from strategy_router import StrategyRouter
 from revenge_mode import RevengeTradeManager
 from live_protection import HardDrawdownGuard, SymbolCircuitBreaker
+from ftmo_compliance import (
+    ACCOUNT_TYPE_STANDARD,
+    FTMOComplianceConfig,
+    FTMOComplianceEngine,
+)
 from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
+
+ACCOUNT_TYPE = ACCOUNT_TYPE_STANDARD
+BOT_MAGIC = 26072026
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -100,6 +108,28 @@ def format_status(symbol, consecutive_losses, cooldown_until, last_closed_pnl):
         f"cooldown_remaining={cooldown_text} | "
         f"last_closed_pnl={pnl_text}"
     )
+
+
+def close_position_if_needed(broker, position, symbol_label, reason, run_log, started, cycle_counts):
+    result = broker.close_position(position, comment=f"FTMO {reason}")
+    accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+    append_jsonl(
+        run_log,
+        {
+            "event": "position_close_attempt",
+            "symbol": symbol_label,
+            "ticket": getattr(position, "ticket", None),
+            "reason": reason,
+            "accepted": accepted,
+            "time": started,
+        },
+    )
+    cycle_counts["forced_closes"] += int(bool(accepted))
+    return result, accepted
+
+
+def filter_owned_positions(positions):
+    return [position for position in positions if getattr(position, "magic", None) == BOT_MAGIC]
 
 
 def calculate_trade_volume(
@@ -238,6 +268,14 @@ def main():
     parser.add_argument("--revenge-multiplier", type=float, default=2.0)
     parser.add_argument("--revenge-gap-trades", type=int, default=2)
     parser.add_argument("--revenge-boosts", type=int, default=3)
+    parser.add_argument("--account-type", choices=[ACCOUNT_TYPE_STANDARD, "SWING"], default=ACCOUNT_TYPE_STANDARD)
+    parser.add_argument("--ftmo-initial-capital", type=float, default=0.0)
+    parser.add_argument("--news-calendar-url", type=str, default=None)
+    parser.add_argument("--news-pre-minutes", type=int, default=2)
+    parser.add_argument("--news-post-minutes", type=int, default=2)
+    parser.add_argument("--news-gap-minutes", type=int, default=5)
+    parser.add_argument("--news-flatten-before-minutes", type=int, default=5)
+    parser.add_argument("--market-close-buffer-minutes", type=int, default=5)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
     parser.add_argument("--break-even-trigger-pct", type=float, default=1.0)
@@ -256,6 +294,7 @@ def main():
     )
     hard_drawdown = HardDrawdownGuard(enabled=args.hard_drawdown_switch, drawdown_pct=args.hard_drawdown_pct)
     symbol_breaker = SymbolCircuitBreaker(max_stop_losses=2)
+    compliance = None
     trade_states = {}
     log_dir = ensure_log_dir()
     cooldown_until = None
@@ -275,6 +314,7 @@ def main():
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
     print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
+    print(f"FTMO account type: {args.account_type}")
 
     broker = None
     if not args.dry_run:
@@ -289,6 +329,28 @@ def main():
         except MT5UnavailableError as exc:
             print(f"MT5 unavailable, falling back to dry-run: {exc}")
             args.dry_run = True
+
+    if broker is not None:
+        account_info = broker.mt5.account_info()
+        initial_capital = float(args.ftmo_initial_capital or (getattr(account_info, "balance", 0.0) or 0.0) or 0.0)
+        compliance = FTMOComplianceEngine(
+            FTMOComplianceConfig(
+                account_type=args.account_type,
+                initial_balance=initial_capital,
+                news_pre_minutes=args.news_pre_minutes,
+                news_post_minutes=args.news_post_minutes,
+                news_gap_minutes=args.news_gap_minutes,
+                flatten_before_news_minutes=args.news_flatten_before_minutes,
+                market_close_buffer_minutes=args.market_close_buffer_minutes,
+                calendar_url=args.news_calendar_url or FTMOComplianceConfig().calendar_url,
+            )
+        )
+        if account_info is not None:
+            compliance.refresh_account(
+                balance=float(getattr(account_info, "balance", initial_capital) or initial_capital),
+                equity=float(getattr(account_info, "equity", initial_capital) or initial_capital),
+                now_utc=datetime.now(timezone.utc),
+            )
 
     while True:
         started = datetime.now(timezone.utc)
@@ -348,6 +410,17 @@ def main():
                     f"PnL=${session_pnl:+.2f} ({pnl_pct:+.2f}%) | "
                     f"ref_balance=${reference_balance:.2f}"
                 )
+                if compliance is not None:
+                    report = compliance.refresh_account(
+                        balance=float(getattr(account := broker.mt5.account_info(), "balance", current_equity) or current_equity),
+                        equity=float(getattr(account, "equity", current_equity) or current_equity),
+                        now_utc=started,
+                    )
+                    print(
+                        f"FTMO | Prague={compliance.current_report()['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"DailyLimit=${report['daily_limit']:.2f} | DailyBuf=${report['daily_buffer']:+.2f} | "
+                        f"TotalLimit=${report['total_limit']:.2f} | TotalBuf=${report['total_buffer']:+.2f}"
+                    )
 
         live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
 
@@ -459,9 +532,24 @@ def main():
                     continue
 
                 if broker and not args.dry_run:
-                    positions = broker.positions_get(symbol=broker_symbol)
+                    positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                     if positions:
                         current_position = positions[0]
+                        if compliance is not None:
+                            flatten_state = compliance.should_flatten_position(symbol, now_utc=started)
+                            if flatten_state is not None and flatten_state.get("reason") in {"market_closed", "loss_limit_breached", "news_flatten"}:
+                                if flatten_state.get("reason") != "news_flatten" or not flatten_state.get("active", False):
+                                    result, accepted = close_position_if_needed(
+                                        broker,
+                                        current_position,
+                                        symbol,
+                                        flatten_state.get("reason", "compliance_flatten"),
+                                        run_log,
+                                        started,
+                                        cycle_counts,
+                                    )
+                                    if accepted:
+                                        continue
                         state = ensure_trade_state(trade_states, current_position, state_key=symbol)
                         current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
                         updated, state = update_trade_mfe(trade_states, current_position, current_profit, state_key=symbol)
@@ -554,6 +642,23 @@ def main():
                     )
                     cycle_counts["revenge_waiting"] += 1
                     continue
+
+                if compliance is not None:
+                    block_state = compliance.should_block_new_entry(symbol, now_utc=started)
+                    if block_state is not None:
+                        print(f"{symbol}: blocked by FTMO compliance ({block_state['reason']})")
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip",
+                                "symbol": symbol,
+                                "reason": block_state["reason"],
+                                "broker_time": data.index[-1].to_pydatetime(),
+                                "ftmo_state": block_state,
+                            },
+                        )
+                        cycle_counts["ftmo_blocked"] += 1
+                        continue
 
                 signal, strategy = latest_signal(symbol, data, router)
                 atr = float(data["atr"].iloc[-1])
@@ -675,7 +780,7 @@ def main():
                 cycle_counts["signals"] += 1
 
                 if broker and not args.dry_run:
-                    active_positions = broker.positions_total(symbol)
+                    active_positions = len(filter_owned_positions(broker.positions_get(symbol=broker_symbol)))
                     if active_positions >= 1:
                         print(f"{symbol}: skipped because position already open")
                         cycle_counts["skip_open_position"] += 1
@@ -692,7 +797,7 @@ def main():
                     accepted = getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                     cycle_counts["orders_sent"] += int(bool(accepted))
                     if accepted:
-                        positions = broker.positions_get(symbol=broker_symbol)
+                        positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                         if positions:
                             current_position = positions[0]
                             trade_states[symbol] = {

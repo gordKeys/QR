@@ -49,6 +49,14 @@ def main():
     parser.add_argument("--revenge-multiplier", type=float, help="Live mode only")
     parser.add_argument("--revenge-gap-trades", type=int, help="Live mode only")
     parser.add_argument("--revenge-boosts", type=int, help="Live mode only")
+    parser.add_argument("--account-type", choices=["STANDARD", "SWING"], help="Live mode only")
+    parser.add_argument("--ftmo-initial-capital", type=float, help="Live mode only")
+    parser.add_argument("--news-calendar-url", type=str, help="Live mode only")
+    parser.add_argument("--news-pre-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-post-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-gap-minutes", type=int, help="Live mode only")
+    parser.add_argument("--news-flatten-before-minutes", type=int, help="Live mode only")
+    parser.add_argument("--market-close-buffer-minutes", type=int, help="Live mode only")
     parser.add_argument("--hard-drawdown-switch", action="store_true", help="Live mode only")
     parser.add_argument("--hard-drawdown-usd", type=float, help="Live mode only")
     parser.add_argument("--use-mt5-costs", action="store_true", help="MTF/patterns mode only")
@@ -123,6 +131,22 @@ def main():
             live_args.extend(["--revenge-gap-trades", str(args.revenge_gap_trades)])
         if args.revenge_boosts is not None:
             live_args.extend(["--revenge-boosts", str(args.revenge_boosts)])
+        if args.account_type is not None:
+            live_args.extend(["--account-type", args.account_type])
+        if args.ftmo_initial_capital is not None:
+            live_args.extend(["--ftmo-initial-capital", str(args.ftmo_initial_capital)])
+        if args.news_calendar_url is not None:
+            live_args.extend(["--news-calendar-url", args.news_calendar_url])
+        if args.news_pre_minutes is not None:
+            live_args.extend(["--news-pre-minutes", str(args.news_pre_minutes)])
+        if args.news_post_minutes is not None:
+            live_args.extend(["--news-post-minutes", str(args.news_post_minutes)])
+        if args.news_gap_minutes is not None:
+            live_args.extend(["--news-gap-minutes", str(args.news_gap_minutes)])
+        if args.news_flatten_before_minutes is not None:
+            live_args.extend(["--news-flatten-before-minutes", str(args.news_flatten_before_minutes)])
+        if args.market_close_buffer_minutes is not None:
+            live_args.extend(["--market-close-buffer-minutes", str(args.market_close_buffer_minutes)])
         if args.hard_drawdown_switch:
             live_args.append("--hard-drawdown-switch")
         if args.hard_drawdown_usd is not None:
