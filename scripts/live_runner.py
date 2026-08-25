@@ -110,6 +110,13 @@ def format_status(symbol, consecutive_losses, cooldown_until, last_closed_pnl):
     )
 
 
+def format_countdown(seconds):
+    total_seconds = max(0, int(seconds or 0))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def close_position_if_needed(broker, position, symbol_label, reason, run_log, started, cycle_counts):
     result = broker.close_position(position, comment=f"FTMO {reason}")
     accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
@@ -387,8 +394,10 @@ def main():
             append_jsonl(run_log, {"event": "cooldown_lifted", "time": started})
 
         if broker and not args.dry_run:
-            current_equity = broker.account_equity()
-            if current_equity is not None:
+            account_info = broker.mt5.account_info()
+            current_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
+            current_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
+            if current_equity is not None and current_balance is not None:
                 if hard_drawdown_day != current_day:
                     hard_drawdown.reset_day(current_equity)
                     hard_drawdown_day = current_day
@@ -406,19 +415,23 @@ def main():
                 session_pnl = current_equity - reference_balance
                 pnl_pct = (session_pnl / reference_balance * 100.0) if reference_balance else 0.0
                 print(
-                    f"ACCOUNT | balance=${current_equity:.2f} | "
+                    f"ACCOUNT | balance=${current_balance:.2f} | equity=${current_equity:.2f} | "
                     f"PnL=${session_pnl:+.2f} ({pnl_pct:+.2f}%) | "
                     f"ref_balance=${reference_balance:.2f}"
                 )
                 if compliance is not None:
                     report = compliance.refresh_account(
-                        balance=float(getattr(account := broker.mt5.account_info(), "balance", current_equity) or current_equity),
-                        equity=float(getattr(account, "equity", current_equity) or current_equity),
+                        balance=current_balance,
+                        equity=current_equity,
                         now_utc=started,
                     )
+                    countdown = format_countdown(report.get("seconds_to_reset"))
                     print(
-                        f"FTMO | Prague={compliance.current_report()['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"FTMO | Prague={report['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"DayResetIn={countdown} | "
+                        f"DailyBase=${report['daily_basis_balance']:.2f} | DailyMaxLoss=${report['daily_loss_amount']:.2f} | "
                         f"DailyLimit=${report['daily_limit']:.2f} | DailyBuf=${report['daily_buffer']:+.2f} | "
+                        f"TotalBase=${report['total_basis_balance']:.2f} | TotalMaxLoss=${report['total_loss_amount']:.2f} | "
                         f"TotalLimit=${report['total_limit']:.2f} | TotalBuf=${report['total_buffer']:+.2f}"
                     )
 

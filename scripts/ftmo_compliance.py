@@ -6,7 +6,7 @@ import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -56,8 +56,8 @@ class NewsEvent:
 class FTMOComplianceConfig:
     account_type: str = ACCOUNT_TYPE_STANDARD
     initial_balance: float = 0.0
-    max_daily_loss_pct: float = 0.05
-    max_total_loss_pct: float = 0.10
+    max_daily_loss_pct: float = 5.0
+    max_total_loss_pct: float = 10.0
     news_pre_minutes: int = 2
     news_post_minutes: int = 2
     news_gap_minutes: int = 5
@@ -76,6 +76,7 @@ class FTMOComplianceEngine:
         self._events_cache_time: datetime | None = None
         self._cached_prague_day: date | None = None
         self._cached_midnight_balance: float | None = None
+        self._cached_highest_midnight_balance: float | None = None
         self._cached_initial_balance: float = float(config.initial_balance or 0.0)
         self._current_equity: float | None = None
         self._current_balance: float | None = None
@@ -95,6 +96,7 @@ class FTMOComplianceEngine:
         payload = {
             "prague_day": self._cached_prague_day.isoformat() if self._cached_prague_day else None,
             "midnight_balance": self._cached_midnight_balance,
+            "highest_midnight_balance": self._cached_highest_midnight_balance,
             "initial_balance": self._cached_initial_balance,
         }
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -128,6 +130,7 @@ class FTMOComplianceEngine:
 
         stored_day = self._state.get("prague_day")
         stored_midnight_balance = self._parse_number(self._state.get("midnight_balance"))
+        stored_highest_midnight_balance = self._parse_number(self._state.get("highest_midnight_balance"))
         stored_initial_balance = self._parse_number(self._state.get("initial_balance"))
 
         if stored_initial_balance is not None and stored_initial_balance > 0:
@@ -138,29 +141,45 @@ class FTMOComplianceEngine:
         if stored_day == prague_day.isoformat() and stored_midnight_balance is not None:
             self._cached_prague_day = prague_day
             self._cached_midnight_balance = stored_midnight_balance
+            self._cached_highest_midnight_balance = max(
+                float(stored_highest_midnight_balance or stored_midnight_balance or balance),
+                float(stored_midnight_balance or balance),
+                float(self._cached_initial_balance or balance),
+            )
         else:
             self._cached_prague_day = prague_day
             self._cached_midnight_balance = float(balance)
+            previous_highest = float(stored_highest_midnight_balance or stored_midnight_balance or balance)
+            self._cached_highest_midnight_balance = max(previous_highest, self._cached_midnight_balance, float(self._cached_initial_balance or balance))
             self._state = {
                 "prague_day": prague_day.isoformat(),
                 "midnight_balance": self._cached_midnight_balance,
+                "highest_midnight_balance": self._cached_highest_midnight_balance,
                 "initial_balance": self._cached_initial_balance,
             }
             self._save_state()
 
         daily_loss_amount = self._cached_initial_balance * (self.config.max_daily_loss_pct / 100.0)
         total_loss_amount = self._cached_initial_balance * (self.config.max_total_loss_pct / 100.0)
+        next_prague_midnight = datetime.combine(prague_day + timedelta(days=1), time.min, tzinfo=PRAGUE_TZ)
+        seconds_to_reset = max(0.0, (next_prague_midnight - prague_now).total_seconds())
+        daily_basis_balance = self._cached_midnight_balance
+        total_basis_balance = max(float(self._cached_initial_balance), float(self._cached_highest_midnight_balance or self._cached_initial_balance))
 
-        daily_limit = self._cached_midnight_balance - daily_loss_amount
-        total_limit = self._cached_initial_balance - total_loss_amount
+        daily_limit = daily_basis_balance - daily_loss_amount
+        total_limit = total_basis_balance - total_loss_amount
 
         self._current_limit_state = {
+            "daily_basis_balance": daily_basis_balance,
+            "total_basis_balance": total_basis_balance,
             "daily_limit": daily_limit,
             "total_limit": total_limit,
             "daily_buffer": self._current_equity - daily_limit,
             "total_buffer": self._current_equity - total_limit,
             "daily_loss_amount": daily_loss_amount,
             "total_loss_amount": total_loss_amount,
+            "prague_midnight_next": next_prague_midnight,
+            "seconds_to_reset": seconds_to_reset,
         }
         return self._current_limit_state
 
@@ -173,11 +192,18 @@ class FTMOComplianceEngine:
         current_pnl_pct = (current_pnl / self._cached_initial_balance * 100.0) if self._cached_initial_balance else 0.0
         return {
             "prague_now": prague_now,
+            "prague_midnight_next": self._current_limit_state.get("prague_midnight_next"),
+            "seconds_to_reset": self._current_limit_state.get("seconds_to_reset"),
             "balance": self._current_balance,
             "equity": self._current_equity,
             "pnl": current_pnl,
             "pnl_pct": current_pnl_pct,
             "midnight_balance": self._cached_midnight_balance,
+            "highest_midnight_balance": self._cached_highest_midnight_balance,
+            "daily_basis_balance": self._current_limit_state.get("daily_basis_balance"),
+            "total_basis_balance": self._current_limit_state.get("total_basis_balance"),
+            "daily_loss_amount": self._current_limit_state.get("daily_loss_amount"),
+            "total_loss_amount": self._current_limit_state.get("total_loss_amount"),
             "daily_limit": self._current_limit_state.get("daily_limit"),
             "daily_buffer": self._current_limit_state.get("daily_buffer"),
             "total_limit": self._current_limit_state.get("total_limit"),
@@ -365,6 +391,9 @@ class FTMOComplianceEngine:
         return None
 
     def should_flatten_position(self, symbol: str, now_utc: datetime | None = None) -> dict | None:
+        if self.is_loss_limit_breached():
+            return {"reason": "loss_limit_breached"}
+
         if self.should_flatten_position_for_market_hours(symbol, now_utc=now_utc):
             return {"reason": "market_closed"}
 
