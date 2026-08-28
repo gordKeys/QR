@@ -33,6 +33,13 @@ SIZE_MULTIPLIER_BY_SYMBOL = {
     "USDCHF": 0.75,
     "XAUUSD": 0.75,
 }
+MAX_VOLUME_BY_SYMBOL = {
+    "EURUSD": 30.0,
+    "AUDUSD": 30.0,
+    "USDJPY": 30.0,
+    "USDCHF": 30.0,
+    "XAUUSD": 30.0,
+}
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -126,6 +133,69 @@ def format_countdown(seconds):
 
 def symbol_size_multiplier(symbol):
     return SIZE_MULTIPLIER_BY_SYMBOL.get(symbol.upper(), 1.0)
+
+
+def symbol_max_volume(symbol):
+    return MAX_VOLUME_BY_SYMBOL.get(symbol.upper())
+
+
+def apply_symbol_volume_cap(symbol, volume):
+    cap = symbol_max_volume(symbol)
+    if cap is None:
+        return volume
+    return min(volume, cap)
+
+
+def dynamic_tp_target_usd(strategy, symbol):
+    symbol = symbol.upper()
+    strategy_name = getattr(strategy, "strategy_name", "") or strategy.__class__.__name__
+    strategy_name = str(strategy_name).lower()
+    min_score = getattr(strategy, "min_score", None)
+
+    if symbol in {"XAUUSD", "USDJPY"} or "ftmo" in strategy_name:
+        if min_score is not None and min_score >= 4:
+            return 1000.0
+        return 800.0
+
+    if min_score is not None:
+        if min_score >= 4:
+            return 1000.0
+        if min_score >= 3:
+            return 800.0
+        return 600.0
+
+    if "strict" in strategy_name:
+        return 800.0
+
+    return 600.0
+
+
+def adjust_take_profit_for_symbol(broker, symbol, direction, entry_price, volume, commission_round_turn, target_profit_usd):
+    if broker is None or target_profit_usd is None:
+        return None
+
+    info = broker.symbol_info(symbol)
+    if info is None:
+        return None
+
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    contract_size = float(getattr(info, "trade_contract_size", 0.0) or 0.0)
+    gross_profit = float(target_profit_usd) + (float(commission_round_turn or 0.0) * max(volume, 0.0))
+
+    if tick_value > 0 and tick_size > 0:
+        value_per_price_unit = tick_value / tick_size
+        price_distance = gross_profit / (max(volume, 0.01) * value_per_price_unit)
+    elif contract_size > 0:
+        price_distance = gross_profit / (max(volume, 0.01) * contract_size)
+    else:
+        return None
+
+    if price_distance <= 0:
+        return None
+
+    target = entry_price + price_distance if direction == 1 else entry_price - price_distance
+    return broker.normalize_price(symbol, target)
 
 
 def close_position_if_needed(broker, position, symbol_label, reason, run_log, started, cycle_counts):
@@ -548,6 +618,7 @@ def main():
         for symbol_ctx in live_symbols:
             symbol = symbol_ctx["symbol"]
             broker_symbol = symbol_ctx["broker_symbol"]
+            owned_positions_count = len(filter_owned_positions(broker.positions_get())) if broker and not args.dry_run else 0
 
             print(format_status(symbol, guard.consecutive_losses, cooldown_until, last_closed_pnl))
             with timed(f"{symbol} evaluation"):
@@ -625,6 +696,13 @@ def main():
                                             "time": started,
                                         },
                                     )
+                    elif owned_positions_count >= rules.max_open_positions:
+                        print(
+                            f"{symbol}: skipped because max open positions reached "
+                            f"({owned_positions_count}/{rules.max_open_positions})"
+                        )
+                        cycle_counts["skip_max_open_positions"] += 1
+                        continue
 
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
@@ -785,6 +863,37 @@ def main():
                     append_jsonl(run_log, {"event": "skip_zero_size", "symbol": symbol, "reason": size_reason, "broker_time": broker_time})
                     continue
 
+                size = apply_symbol_volume_cap(symbol, size)
+                if broker and not args.dry_run:
+                    size = broker.normalize_volume(broker_symbol, size)
+                if size <= 0:
+                    print(f"{symbol}: skipped due to capped sizing ({size_reason})")
+                    cycle_counts["skip_zero_size"] += 1
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "skip_zero_size",
+                            "symbol": symbol,
+                            "reason": f"capped_{size_reason}",
+                            "broker_time": broker_time,
+                        },
+                    )
+                    continue
+
+                if broker and not args.dry_run:
+                    tp_target_usd = dynamic_tp_target_usd(strategy, symbol)
+                    adjusted_target = adjust_take_profit_for_symbol(
+                        broker=broker,
+                        symbol=broker_symbol,
+                        direction=signal,
+                        entry_price=price,
+                        volume=size,
+                        commission_round_turn=args.break_even_commission_round_turn,
+                        target_profit_usd=tp_target_usd,
+                    )
+                    if adjusted_target is not None:
+                        target = adjusted_target
+
                 print(
                     f"{symbol}: strategy={strategy.__class__.__name__} signal={signal} "
                     f"price={price:.5f} size={size:.2f} sl={stop:.5f} tp={target:.5f}"
@@ -836,6 +945,7 @@ def main():
                     accepted = getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                     cycle_counts["orders_sent"] += int(bool(accepted))
                     if accepted:
+                        owned_positions_count += 1
                         positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                         if positions:
                             current_position = positions[0]
