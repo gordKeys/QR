@@ -6,7 +6,7 @@ class FtmoRules:
         max_daily_loss_pct=5.0,
         max_total_loss_pct=10.0,
         max_risk_per_trade_pct=5.0,
-        max_open_positions=1,
+        max_open_positions=2,
         max_consecutive_losses=3,
     ):
         self.initial_balance = initial_balance

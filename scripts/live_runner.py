@@ -40,6 +40,8 @@ MAX_VOLUME_BY_SYMBOL = {
     "USDCHF": 30.0,
     "XAUUSD": 30.0,
 }
+EUR_GBP_GROUP = {"EURUSD", "GBPUSD"}
+RISK_GROUP = {"AUDUSD", "USDCHF", "USDJPY", "XAUUSD"}
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -139,11 +141,30 @@ def symbol_max_volume(symbol):
     return MAX_VOLUME_BY_SYMBOL.get(symbol.upper())
 
 
+def symbol_trade_group(symbol):
+    upper = symbol.upper()
+    if upper in EUR_GBP_GROUP:
+        return "eur_gbp"
+    if upper in RISK_GROUP:
+        return "risk_group"
+    return upper
+
+
 def apply_symbol_volume_cap(symbol, volume):
     cap = symbol_max_volume(symbol)
     if cap is None:
         return volume
     return min(volume, cap)
+
+
+def count_owned_positions_in_group(positions, alias_map, symbol):
+    target_group = symbol_trade_group(symbol)
+    count = 0
+    for position in positions:
+        canonical_symbol = alias_map.get(str(getattr(position, "symbol", "")).upper(), str(getattr(position, "symbol", "")).upper())
+        if symbol_trade_group(canonical_symbol) == target_group:
+            count += 1
+    return count
 
 
 def dynamic_tp_target_usd(strategy, symbol):
@@ -618,7 +639,6 @@ def main():
         for symbol_ctx in live_symbols:
             symbol = symbol_ctx["symbol"]
             broker_symbol = symbol_ctx["broker_symbol"]
-            owned_positions_count = len(filter_owned_positions(broker.positions_get())) if broker and not args.dry_run else 0
 
             print(format_status(symbol, guard.consecutive_losses, cooldown_until, last_closed_pnl))
             with timed(f"{symbol} evaluation"):
@@ -630,6 +650,7 @@ def main():
                     continue
 
                 if broker and not args.dry_run:
+                    all_owned_positions = filter_owned_positions(broker.positions_get())
                     positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                     if positions:
                         current_position = positions[0]
@@ -696,13 +717,22 @@ def main():
                                             "time": started,
                                         },
                                     )
-                    elif owned_positions_count >= rules.max_open_positions:
-                        print(
-                            f"{symbol}: skipped because max open positions reached "
-                            f"({owned_positions_count}/{rules.max_open_positions})"
-                        )
-                        cycle_counts["skip_max_open_positions"] += 1
-                        continue
+                    else:
+                        group_positions = count_owned_positions_in_group(all_owned_positions, symbol_aliases, symbol)
+                        if group_positions >= 1:
+                            print(
+                                f"{symbol}: skipped because its trade group already has an open position "
+                                f"({group_positions}/1)"
+                            )
+                            cycle_counts["skip_group_cap"] += 1
+                            continue
+                        if len(all_owned_positions) >= rules.max_open_positions:
+                            print(
+                                f"{symbol}: skipped because max open positions reached "
+                                f"({len(all_owned_positions)}/{rules.max_open_positions})"
+                            )
+                            cycle_counts["skip_max_open_positions"] += 1
+                            continue
 
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
