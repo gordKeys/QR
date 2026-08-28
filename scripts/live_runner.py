@@ -301,7 +301,7 @@ def main():
     args = parser.parse_args()
 
     router = StrategyRouter()
-    rules = FtmoRules(initial_balance=10000, max_consecutive_losses=args.max_consecutive_losses)
+    rules = FtmoRules(initial_balance=10000, max_open_positions=2, max_consecutive_losses=args.max_consecutive_losses)
     guard = FtmoRiskGuard(rules)
     risk = RiskManager(risk_per_trade=rules.max_risk_per_trade_pct)
     revenge = RevengeTradeManager(
@@ -815,6 +815,14 @@ def main():
                     if active_positions >= 1:
                         print(f"{symbol}: skipped because position already open")
                         cycle_counts["skip_open_position"] += 1
+                        continue
+                    total_open_positions = len(filter_owned_positions(broker.positions_get()))
+                    if total_open_positions >= rules.max_open_positions:
+                        print(
+                            f"{symbol}: skipped because max open positions reached "
+                            f"({total_open_positions}/{rules.max_open_positions})"
+                        )
+                        cycle_counts["skip_max_open_positions"] += 1
                         continue
                     result = broker.place_order(
                         symbol=broker_symbol,
