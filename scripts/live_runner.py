@@ -26,6 +26,13 @@ from timing_utils import timed
 
 ACCOUNT_TYPE = ACCOUNT_TYPE_STANDARD
 BOT_MAGIC = 26072026
+SIZE_MULTIPLIER_BY_SYMBOL = {
+    "EURUSD": 0.75,
+    "AUDUSD": 0.75,
+    "USDJPY": 0.75,
+    "USDCHF": 0.75,
+    "XAUUSD": 0.75,
+}
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -115,6 +122,10 @@ def format_countdown(seconds):
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def symbol_size_multiplier(symbol):
+    return SIZE_MULTIPLIER_BY_SYMBOL.get(symbol.upper(), 1.0)
 
 
 def close_position_if_needed(broker, position, symbol_label, reason, run_log, started, cycle_counts):
@@ -265,7 +276,7 @@ def update_trade_mfe(trade_states, position, new_profit, state_key=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
+    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "XAUUSD"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
@@ -729,7 +740,7 @@ def main():
                     price = float(strategy_plan.get("price", price))
                     stop = float(strategy_plan.get("stop"))
                     target = float(strategy_plan.get("target"))
-                    size = float(strategy_plan.get("size")) * revenge_context["multiplier"]
+                    size = float(strategy_plan.get("size")) * revenge_context["multiplier"] * symbol_size_multiplier(symbol)
                     size_reason = strategy_plan.get("size_reason", "strategy_plan")
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
@@ -758,10 +769,14 @@ def main():
                             stop_price=stop,
                             account_equity=equity,
                             risk_per_trade=rules.max_risk_per_trade_pct,
-                            size_multiplier=revenge_context["multiplier"],
+                            size_multiplier=revenge_context["multiplier"] * symbol_size_multiplier(symbol),
                         )
                     else:
-                        size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
+                        size = (
+                            risk.calculate_position_size(equity, price, stop, atr=atr)
+                            * revenge_context["multiplier"]
+                            * symbol_size_multiplier(symbol)
+                        )
                         size_reason = "dry_run"
 
                 if size <= 0:
