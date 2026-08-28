@@ -367,7 +367,7 @@ def update_trade_mfe(trade_states, position, new_profit, state_key=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "AUDUSD", "USDCHF", "XAUUSD"])
+    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "AUDUSD", "XAUUSD"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
