@@ -169,6 +169,8 @@ def count_owned_positions_in_group(positions, alias_map, symbol):
 
 def dynamic_tp_target_usd(strategy, symbol):
     symbol = symbol.upper()
+    if symbol in {"EURUSD", "GBPUSD"}:
+        return None
     strategy_name = getattr(strategy, "strategy_name", "") or strategy.__class__.__name__
     strategy_name = str(strategy_name).lower()
     min_score = getattr(strategy, "min_score", None)
