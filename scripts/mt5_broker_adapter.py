@@ -8,7 +8,7 @@ class MT5UnavailableError(RuntimeError):
 
 class MT5BrokerAdapter:
 
-    def __init__(self):
+    def __init__(self, terminal_path=None):
         try:
             import MetaTrader5 as mt5  # type: ignore
         except Exception as exc:
@@ -17,9 +17,14 @@ class MT5BrokerAdapter:
             ) from exc
 
         self.mt5 = mt5
+        self.terminal_path = terminal_path
 
     def initialize(self):
-        if not self.mt5.initialize():
+        if self.terminal_path:
+            initialized = self.mt5.initialize(path=self.terminal_path)
+        else:
+            initialized = self.mt5.initialize()
+        if not initialized:
             raise RuntimeError(f"MT5 initialize failed: {self.mt5.last_error()}")
 
     def shutdown(self):
