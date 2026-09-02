@@ -22,6 +22,8 @@ from timing_utils import timed
 BOT_MAGIC = 26072026
 POSITION_SIZE_MULTIPLIER = 1.20
 MT5_TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+PROFIT_LOCK_STEP_USD = 25.0
+PROFIT_LOCK_MIN_CANDLES = 3
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -208,7 +210,7 @@ def position_side(position, broker):
     return 0
 
 
-def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
+def estimate_profit_lock_stop(position, broker, locked_profit_usd, commission_round_turn_per_lot):
     info = broker.symbol_info(position.symbol)
     tick = broker.symbol_tick(position.symbol)
     if info is None or tick is None:
@@ -217,13 +219,17 @@ def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
     point = float(getattr(info, "point", 0.0) or 0.0)
     digits = int(getattr(info, "digits", 2) or 2)
     contract_size = float(getattr(info, "trade_contract_size", 100000.0) or 100000.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    if volume <= 0 or contract_size <= 0:
+        return None
     spread = 0.0
     if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
         spread = float(tick.ask - tick.bid)
 
-    commission_price = float(commission_round_turn_per_lot) / max(contract_size, 1.0)
+    commission_price = float(commission_round_turn_per_lot) / contract_size
     safety_buffer = max(point * 2, spread * 0.1)
-    buffer = spread + commission_price + safety_buffer
+    profit_price = (float(locked_profit_usd) / volume) / contract_size
+    buffer = spread + commission_price + profit_price + safety_buffer
     direction = position_side(position, broker)
     if direction == 1:
         stop = float(getattr(position, "price_open", 0.0) or 0.0) + buffer
@@ -242,8 +248,8 @@ def ensure_trade_state(trade_states, position, state_key=None):
         state = {
             "ticket": getattr(position, "ticket", None),
             "mfe_usd": float(getattr(position, "profit", 0.0) or 0.0),
-            "break_even_moved": False,
-            "break_even_sl": None,
+            "profit_lock_level": -1.0,
+            "profit_lock_sl": None,
         }
         trade_states[key] = state
     return state
@@ -257,6 +263,20 @@ def update_trade_mfe(trade_states, position, new_profit, state_key=None):
         state["mfe_usd"] = current
         return True, state
     return False, state
+
+
+def completed_candles_held(position, data):
+    if data is None or len(data.index) < 2:
+        return 0
+
+    opened_timestamp = getattr(position, "time", None)
+    if opened_timestamp is None:
+        return 0
+
+    opened_at = pd.Timestamp(datetime.fromtimestamp(float(opened_timestamp), tz=timezone.utc))
+    candle_times = pd.to_datetime(data.index, utc=True)
+    last_closed_candle = candle_times[-2]
+    return int(((candle_times > opened_at) & (candle_times <= last_closed_candle)).sum())
 
 
 def main():
@@ -273,7 +293,6 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
-    parser.add_argument("--break-even-trigger-pct", type=float, default=1.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
     args = parser.parse_args()
 
@@ -312,7 +331,10 @@ def main():
             f"gap_trades={args.revenge_gap_trades}"
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
-    print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
+    print(
+        f"Profit-lock: ${PROFIT_LOCK_STEP_USD:.2f} steps after "
+        f"{PROFIT_LOCK_MIN_CANDLES} completed M5 candles"
+    )
     print(f"Position-size multiplier: {POSITION_SIZE_MULTIPLIER:.2f}x")
 
     broker = None
@@ -415,8 +437,8 @@ def main():
                             "time": closed_time,
                             "consecutive_losses": guard.consecutive_losses,
                             "mfe_usd": trade_state.get("mfe_usd"),
-                            "break_even_moved": trade_state.get("break_even_moved", False),
-                            "break_even_sl": trade_state.get("break_even_sl"),
+                            "profit_lock_level": trade_state.get("profit_lock_level", -1.0),
+                            "profit_lock_sl": trade_state.get("profit_lock_sl"),
                         },
                     )
 
@@ -518,38 +540,49 @@ def main():
                                 },
                             )
 
-                        break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
-                        if not state.get("break_even_moved") and current_profit >= break_even_trigger:
-                            break_even_sl = estimate_break_even_stop(
-                                current_position,
-                                broker,
-                                args.break_even_commission_round_turn,
-                            )
-                            if break_even_sl is not None:
-                                result = broker.modify_position_stops(
-                                    position_ticket=getattr(current_position, "ticket", None),
-                                    symbol=symbol,
-                                    stop_loss=break_even_sl,
-                                    take_profit=getattr(current_position, "tp", None),
+                        held_candles = completed_candles_held(current_position, data)
+                        profit_steps = int(current_profit // PROFIT_LOCK_STEP_USD)
+                        if held_candles >= PROFIT_LOCK_MIN_CANDLES and profit_steps >= 1:
+                            locked_profit = float((profit_steps - 1) * PROFIT_LOCK_STEP_USD)
+                            previous_lock = float(state.get("profit_lock_level", -1.0) or -1.0)
+                            if locked_profit > previous_lock:
+                                profit_lock_sl = estimate_profit_lock_stop(
+                                    current_position,
+                                    broker,
+                                    locked_profit,
+                                    args.break_even_commission_round_turn,
                                 )
-                                accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
-                                if accepted:
-                                    state["break_even_moved"] = True
-                                    state["break_even_sl"] = break_even_sl
-                                    append_jsonl(
-                                        run_log,
-                                        {
-                                            "event": "break_even_moved",
-                                            "symbol": symbol,
-                                            "ticket": getattr(current_position, "ticket", None),
-                                            "profit_usd": current_profit,
-                                            "break_even_trigger_usd": break_even_trigger,
-                                            "break_even_trigger_pct": args.break_even_trigger_pct,
-                                            "new_stop": break_even_sl,
-                                            "mfe_usd": state["mfe_usd"],
-                                            "time": started,
-                                        },
+                                current_stop = float(getattr(current_position, "sl", 0.0) or 0.0)
+                                direction = position_side(current_position, broker)
+                                improves_stop = profit_lock_sl is not None and (
+                                    (direction == 1 and (current_stop <= 0 or profit_lock_sl > current_stop))
+                                    or (direction == -1 and (current_stop <= 0 or profit_lock_sl < current_stop))
+                                )
+                                if improves_stop:
+                                    result = broker.modify_position_stops(
+                                        position_ticket=getattr(current_position, "ticket", None),
+                                        symbol=symbol,
+                                        stop_loss=profit_lock_sl,
+                                        take_profit=getattr(current_position, "tp", None),
                                     )
+                                    accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                                    if accepted:
+                                        state["profit_lock_level"] = locked_profit
+                                        state["profit_lock_sl"] = profit_lock_sl
+                                        append_jsonl(
+                                            run_log,
+                                            {
+                                                "event": "profit_lock_moved",
+                                                "symbol": symbol,
+                                                "ticket": getattr(current_position, "ticket", None),
+                                                "profit_usd": current_profit,
+                                                "held_candles": held_candles,
+                                                "locked_profit_usd": locked_profit,
+                                                "new_stop": profit_lock_sl,
+                                                "mfe_usd": state["mfe_usd"],
+                                                "time": started,
+                                            },
+                                        )
 
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
@@ -738,8 +771,8 @@ def main():
                             trade_states[symbol] = {
                                 "ticket": getattr(current_position, "ticket", None),
                                 "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
-                                "break_even_moved": False,
-                                "break_even_sl": None,
+                                "profit_lock_level": -1.0,
+                                "profit_lock_sl": None,
                             }
                         revenge_update = revenge.on_trade_filled(symbol)
                         if revenge_update is not None:
