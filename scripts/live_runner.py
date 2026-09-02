@@ -24,6 +24,9 @@ POSITION_SIZE_MULTIPLIER = 1.20
 MT5_TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 PROFIT_LOCK_STEP_USD = 25.0
 PROFIT_LOCK_MIN_CANDLES = 3
+TIME_STOP_CANDLES = 12
+BASE_RISK_PER_TRADE = 0.20
+EFFECTIVE_RISK_PER_TRADE = BASE_RISK_PER_TRADE * POSITION_SIZE_MULTIPLIER
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -116,7 +119,7 @@ def format_countdown(seconds):
 
 
 def close_position_if_needed(broker, position, symbol_label, reason, run_log, started, cycle_counts):
-    result = broker.close_position(position, comment=f"FTMO {reason}")
+    result = broker.close_position(position, comment=f"QuantFX {reason}")
     accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
     append_jsonl(
         run_log,
@@ -279,6 +282,29 @@ def completed_candles_held(position, data):
     return int(((candle_times > opened_at) & (candle_times <= last_closed_candle)).sum())
 
 
+def loss_setup_invalidation(position, broker, data, router, symbol):
+    direction = position_side(position, broker)
+    if direction == 0 or len(data.index) < 5:
+        return None
+
+    closed_data = data.iloc[:-1]
+    current_close = float(closed_data["close"].iloc[-1])
+    prior_structure = closed_data.iloc[:-1].tail(3)
+    if prior_structure.empty:
+        return None
+
+    if direction == 1 and current_close < float(prior_structure["low"].min()):
+        return "structure_invalidated"
+    if direction == -1 and current_close > float(prior_structure["high"].max()):
+        return "structure_invalidated"
+
+    signal_series = router.get_strategy(symbol).generate_signals(data)
+    current_signal = int(signal_series.iloc[-1])
+    if current_signal == -direction:
+        return "signal_reversed"
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
@@ -299,7 +325,7 @@ def main():
     router = StrategyRouter()
     rules = FtmoRules(
         initial_balance=10000,
-        max_risk_per_trade_pct=0.20,
+        max_risk_per_trade_pct=BASE_RISK_PER_TRADE,
         max_consecutive_losses=args.max_consecutive_losses,
     )
     guard = FtmoRiskGuard(rules)
@@ -334,6 +360,10 @@ def main():
     print(
         f"Profit-lock: ${PROFIT_LOCK_STEP_USD:.2f} steps after "
         f"{PROFIT_LOCK_MIN_CANDLES} completed M5 candles"
+    )
+    print(
+        f"Effective risk per trade: {EFFECTIVE_RISK_PER_TRADE:.2%} "
+        f"(base={BASE_RISK_PER_TRADE:.2%} × {POSITION_SIZE_MULTIPLIER:.2f}x)"
     )
     print(f"Position-size multiplier: {POSITION_SIZE_MULTIPLIER:.2f}x")
 
@@ -541,6 +571,40 @@ def main():
                             )
 
                         held_candles = completed_candles_held(current_position, data)
+                        if held_candles >= PROFIT_LOCK_MIN_CANDLES and current_profit < 0:
+                            invalidation_reason = loss_setup_invalidation(
+                                current_position,
+                                broker,
+                                data,
+                                router,
+                                symbol,
+                            )
+                            if invalidation_reason is not None:
+                                result, accepted = close_position_if_needed(
+                                    broker,
+                                    current_position,
+                                    symbol,
+                                    invalidation_reason,
+                                    run_log,
+                                    started,
+                                    cycle_counts,
+                                )
+                                if accepted:
+                                    continue
+
+                        if held_candles >= TIME_STOP_CANDLES and current_profit < PROFIT_LOCK_STEP_USD:
+                            result, accepted = close_position_if_needed(
+                                broker,
+                                current_position,
+                                symbol,
+                                "time_stop",
+                                run_log,
+                                started,
+                                cycle_counts,
+                            )
+                            if accepted:
+                                continue
+
                         profit_steps = int(current_profit // PROFIT_LOCK_STEP_USD)
                         if held_candles >= PROFIT_LOCK_MIN_CANDLES and profit_steps >= 1:
                             locked_profit = float((profit_steps - 1) * PROFIT_LOCK_STEP_USD)
@@ -681,8 +745,26 @@ def main():
                     price = float(strategy_plan.get("price", price))
                     stop = float(strategy_plan.get("stop"))
                     target = float(strategy_plan.get("target"))
-                    size = float(strategy_plan.get("size")) * POSITION_SIZE_MULTIPLIER * revenge_context["multiplier"]
-                    size_reason = strategy_plan.get("size_reason", "strategy_plan")
+                    if broker and not args.dry_run:
+                        stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
+                        if stop is None or target is None:
+                            print(f"{symbol}: skipped because broker stop levels are invalid")
+                            cycle_counts["skip_invalid_stops"] += 1
+                            continue
+                        size, size_reason = calculate_trade_volume(
+                            broker=broker,
+                            symbol=broker_symbol,
+                            direction=signal,
+                            entry_price=price,
+                            stop_price=stop,
+                            account_equity=equity,
+                            risk_per_trade=rules.max_risk_per_trade_pct,
+                            size_multiplier=POSITION_SIZE_MULTIPLIER * revenge_context["multiplier"],
+                        )
+                        size_reason = "risk_sized_strategy_plan"
+                    else:
+                        size = risk.calculate_position_size(equity, price, stop, atr=atr) * POSITION_SIZE_MULTIPLIER * revenge_context["multiplier"]
+                        size_reason = "risk_sized_strategy_plan_dry_run"
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
 

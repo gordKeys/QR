@@ -38,6 +38,11 @@ class MTFBacktester:
         risk_per_trade: float = 0.004,
         cost_profile: CostProfile | None = None,
         use_strategy_plans: bool = True,
+        size_multiplier: float = 1.0,
+        profit_lock_step_usd: float = 0.0,
+        profit_lock_min_candles: int = 0,
+        time_stop_candles: int = 0,
+        fixed_spread_points: float | None = None,
     ):
         self.data = data.copy()
         self.strategy = strategy
@@ -47,16 +52,25 @@ class MTFBacktester:
         self.risk_per_trade = float(risk_per_trade)
         self.cost_profile = cost_profile or default_cost_profile(self.symbol)
         self.use_strategy_plans = use_strategy_plans
+        self.size_multiplier = float(size_multiplier)
+        self.profit_lock_step_usd = float(profit_lock_step_usd)
+        self.profit_lock_min_candles = int(profit_lock_min_candles)
+        self.time_stop_candles = int(time_stop_candles)
+        self.fixed_spread_points = fixed_spread_points
         self.risk = RiskManager(risk_per_trade=self.risk_per_trade)
 
         self.position = None
         self.trades = []
         self.equity_curve = []
+        self.position_index = None
+        self.profit_lock_level = -1.0
 
     def _signal_series(self):
         return self.strategy.generate_signals(self.data)
 
     def _spread_cost(self, spread_points):
+        if self.fixed_spread_points is not None:
+            spread_points = self.fixed_spread_points
         return float(spread_points or 0.0) * self.cost_profile.point * self.cost_profile.spread_multiplier
 
     def _entry_price(self, mid_price, direction, spread_points):
@@ -77,7 +91,57 @@ class MTFBacktester:
             return 0.0
         risk_amount = equity * self.risk_per_trade
         raw_lots = risk_amount / (stop_distance * self.cost_profile.contract_size)
-        return max(0.0, raw_lots)
+        return max(0.0, raw_lots * self.size_multiplier)
+
+    def _mark_profit(self, row, spread_points):
+        if self.position is None:
+            return 0.0
+        exit_price = self._exit_price(float(row["close"]), self.position.direction, spread_points)
+        price_change = (
+            exit_price - self.position.entry_price
+            if self.position.direction == 1
+            else self.position.entry_price - exit_price
+        )
+        return price_change * self.position.position_size * self.cost_profile.contract_size
+
+    def _setup_invalidated(self, index, signals):
+        if self.position is None or index < 4:
+            return False
+        direction = self.position.direction
+        current_close = float(self.data.iloc[index]["close"])
+        prior = self.data.iloc[max(0, index - 3):index]
+        if direction == 1 and current_close < float(prior["low"].min()):
+            return True
+        if direction == -1 and current_close > float(prior["high"].max()):
+            return True
+        return int(signals.iloc[index]) == -direction
+
+    def _update_profit_lock(self, row, index, spread_points):
+        if self.position is None or self.profit_lock_step_usd <= 0:
+            return
+        held_candles = index - self.position_index
+        current_profit = self._mark_profit(row, spread_points)
+        if held_candles < self.profit_lock_min_candles or current_profit < self.profit_lock_step_usd:
+            return
+
+        steps = int(current_profit // self.profit_lock_step_usd)
+        locked_profit = float((steps - 1) * self.profit_lock_step_usd)
+        if locked_profit <= self.profit_lock_level:
+            return
+
+        volume = self.position.position_size
+        contract_size = self.cost_profile.contract_size
+        spread = self._spread_cost(spread_points)
+        price_distance = locked_profit / max(volume * contract_size, 1e-9)
+        if self.position.direction == 1:
+            candidate = self.position.entry_price + spread + price_distance
+            if candidate > self.position.stop_loss:
+                self.position.stop_loss = candidate
+        else:
+            candidate = self.position.entry_price - spread - price_distance
+            if candidate < self.position.stop_loss:
+                self.position.stop_loss = candidate
+        self.profit_lock_level = locked_profit
 
     def _finalize_trade(self, trade, exit_time, exit_price, reason):
         trade.exit_time = exit_time
@@ -127,6 +191,29 @@ class MTFBacktester:
                         exit_price = self._exit_price(self.position.take_profit, -1, spread_points)
                         self._finalize_trade(self.position, timestamp, exit_price, "target")
 
+                if self.position is not None:
+                    held_candles = index - self.position_index
+                    current_profit = self._mark_profit(row, spread_points)
+                    if (
+                        self.profit_lock_min_candles > 0
+                        and held_candles >= self.profit_lock_min_candles
+                        and current_profit < 0
+                        and self._setup_invalidated(index, signals)
+                    ):
+                        exit_price = self._exit_price(mid_price, self.position.direction, spread_points)
+                        self._finalize_trade(self.position, timestamp, exit_price, "invalidation")
+                    elif (
+                        self.position is not None
+                        and self.time_stop_candles > 0
+                        and held_candles >= self.time_stop_candles
+                        and current_profit < self.profit_lock_step_usd
+                    ):
+                        exit_price = self._exit_price(mid_price, self.position.direction, spread_points)
+                        self._finalize_trade(self.position, timestamp, exit_price, "time_stop")
+
+                if self.position is not None:
+                    self._update_profit_lock(row, index, spread_points)
+
             signal = int(signals.iloc[index]) if index < len(signals) else 0
             if self.position is None and signal != 0 and pd.notna(row.get("atr", None)):
                 plan = None
@@ -171,6 +258,8 @@ class MTFBacktester:
                         position_size=lots,
                         last_swap_date=timestamp.date(),
                     )
+                    self.position_index = index
+                    self.profit_lock_level = -1.0
 
             self.equity_curve.append(self.balance)
 

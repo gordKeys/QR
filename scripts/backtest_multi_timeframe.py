@@ -50,12 +50,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", help="Optional symbol list. Defaults to the recommended universe.")
     parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--initial-balance", type=float, default=10000.0)
-    parser.add_argument("--risk-pct", type=float, default=0.004)
-    parser.add_argument("--commission-round-turn", type=float, default=7.0)
+    parser.add_argument("--initial-balance", type=float, default=500.0)
+    parser.add_argument("--risk-pct", type=float, default=0.20)
+    parser.add_argument("--size-multiplier", type=float, default=1.20)
+    parser.add_argument("--profit-lock-step", type=float, default=25.0)
+    parser.add_argument("--profit-lock-candles", type=int, default=3)
+    parser.add_argument("--time-stop-candles", type=int, default=12)
+    parser.add_argument("--spread-points", type=float, default=0.1)
+    parser.add_argument("--commission-round-turn", type=float, default=0.0)
     parser.add_argument("--swap-long", type=float, default=0.0)
     parser.add_argument("--swap-short", type=float, default=0.0)
     parser.add_argument("--use-mt5-costs", action="store_true")
+    parser.add_argument("--use-strategy-plans", action="store_true")
     parser.add_argument("--top-n", type=int, default=5)
     args = parser.parse_args()
 
@@ -120,6 +126,12 @@ def main():
                 initial_balance=args.initial_balance,
                 risk_per_trade=args.risk_pct,
                 cost_profile=cost_profile,
+                use_strategy_plans=args.use_strategy_plans,
+                size_multiplier=args.size_multiplier,
+                profit_lock_step_usd=args.profit_lock_step,
+                profit_lock_min_candles=args.profit_lock_candles,
+                time_stop_candles=args.time_stop_candles,
+                fixed_spread_points=args.spread_points,
             ).run()
 
             score = summarize_result(result)
