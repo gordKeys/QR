@@ -25,6 +25,7 @@ MT5_TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 PROFIT_LOCK_STEP_USD = 25.0
 PROFIT_LOCK_MIN_CANDLES = 3
 TIME_STOP_CANDLES = 12
+LOSS_MANAGEMENT_EXITS_ENABLED = False
 BASE_RISK_PER_TRADE = 0.20
 EFFECTIVE_RISK_PER_TRADE = BASE_RISK_PER_TRADE * POSITION_SIZE_MULTIPLIER
 
@@ -361,6 +362,7 @@ def main():
         f"Profit-lock: ${PROFIT_LOCK_STEP_USD:.2f} steps after "
         f"{PROFIT_LOCK_MIN_CANDLES} completed M5 candles"
     )
+    print(f"Loss-management exits: {'ON' if LOSS_MANAGEMENT_EXITS_ENABLED else 'OFF'}")
     print(
         f"Effective risk per trade: {EFFECTIVE_RISK_PER_TRADE:.2%} "
         f"(base={BASE_RISK_PER_TRADE:.2%} × {POSITION_SIZE_MULTIPLIER:.2f}x)"
@@ -571,7 +573,7 @@ def main():
                             )
 
                         held_candles = completed_candles_held(current_position, data)
-                        if held_candles >= PROFIT_LOCK_MIN_CANDLES and current_profit < 0:
+                        if LOSS_MANAGEMENT_EXITS_ENABLED and held_candles >= PROFIT_LOCK_MIN_CANDLES and current_profit < 0:
                             invalidation_reason = loss_setup_invalidation(
                                 current_position,
                                 broker,
@@ -592,7 +594,7 @@ def main():
                                 if accepted:
                                     continue
 
-                        if held_candles >= TIME_STOP_CANDLES and current_profit < PROFIT_LOCK_STEP_USD:
+                        if LOSS_MANAGEMENT_EXITS_ENABLED and held_candles >= TIME_STOP_CANDLES and current_profit < PROFIT_LOCK_STEP_USD:
                             result, accepted = close_position_if_needed(
                                 broker,
                                 current_position,
