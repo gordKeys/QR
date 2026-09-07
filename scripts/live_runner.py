@@ -977,7 +977,6 @@ def main():
                     accepted = getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                     cycle_counts["orders_sent"] += int(bool(accepted))
                     if accepted:
-                        owned_positions_count += 1
                         positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                         if positions:
                             current_position = positions[0]
