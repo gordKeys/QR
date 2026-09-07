@@ -643,6 +643,19 @@ def main():
                         size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
                         size_reason = "dry_run"
 
+                if broker and not args.dry_run:
+                    stop, target = broker.conform_stop_levels(
+                        broker_symbol,
+                        signal,
+                        price,
+                        stop,
+                        target,
+                    )
+                    if stop is None or target is None:
+                        print(f"{symbol}: skipped because broker stop levels are invalid")
+                        cycle_counts["skip_invalid_stops"] += 1
+                        continue
+
                 if size <= 0:
                     print(f"{symbol}: skipped due to sizing ({size_reason})")
                     cycle_counts["skip_zero_size"] += 1
