@@ -128,7 +128,7 @@ def main():
         if args.hard_drawdown_usd is not None:
             live_args.extend(["--hard-drawdown-usd", str(args.hard_drawdown_usd)])
         if not live_args:
-            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
+            live_args = ["--symbols", "EURUSD", "GBPUSD", "AUDUSD", "USDJPY"]
         return run_script("live_runner.py", live_args)
 
     return 1
