@@ -31,8 +31,8 @@ class RiskManager:
         direction,
         entry,
         atr,
-        sl_atr=2.5,
-        tp_atr=5.0
+        sl_atr=1.5,
+        tp_atr=2.0
     ):
 
         if direction == 1:
