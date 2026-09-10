@@ -23,7 +23,7 @@ class StrategyRouter:
                 use_candle=True,
                 require_trend_alignment=True,
                 min_score=5,
-                rr=1.5,
+                rr=1.2,
                 atr=0.8,
                 fast=5,
                 slow=13,
