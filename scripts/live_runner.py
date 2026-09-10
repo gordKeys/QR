@@ -20,6 +20,9 @@ from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
 
 
+BOT_MAGIC = 26072026
+
+
 def build_data_for_symbol(symbol, broker=None):
     if broker is None:
         return FeatureEngine().add_features(DataLoader(symbol=symbol).load())
@@ -64,6 +67,10 @@ def build_live_symbol_context(symbols, broker, dry_run):
         alias_map[broker_symbol.upper()] = canonical_symbol
         alias_map[canonical_symbol.upper()] = canonical_symbol
     return context, alias_map
+
+
+def filter_owned_positions(positions):
+    return [position for position in positions if getattr(position, "magic", None) == BOT_MAGIC]
 
 
 def ensure_log_dir():
@@ -459,7 +466,7 @@ def main():
                     continue
 
                 if broker and not args.dry_run:
-                    positions = broker.positions_get(symbol=broker_symbol)
+                    positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                     if positions:
                         current_position = positions[0]
                         state = ensure_trade_state(trade_states, current_position, state_key=symbol)
@@ -675,10 +682,15 @@ def main():
                 cycle_counts["signals"] += 1
 
                 if broker and not args.dry_run:
-                    active_positions = broker.positions_total(symbol)
+                    active_positions = len(filter_owned_positions(broker.positions_get(symbol=broker_symbol)))
                     if active_positions >= 1:
                         print(f"{symbol}: skipped because position already open")
                         cycle_counts["skip_open_position"] += 1
+                        continue
+                    total_owned_positions = len(filter_owned_positions(broker.positions_get()))
+                    if total_owned_positions >= rules.max_open_positions:
+                        print(f"{symbol}: skipped because max open positions reached ({rules.max_open_positions})")
+                        cycle_counts["skip_max_open_positions"] += 1
                         continue
                     result = broker.place_order(
                         symbol=broker_symbol,

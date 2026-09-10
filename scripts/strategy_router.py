@@ -30,8 +30,8 @@ class StrategyRouter:
                 rsi_p=9,
                 ob=68,
                 os=32,
-                mirror=True,
-                strategy_name="five_signal_confluence_scalper_strict_jpy_trend",
+                mirror=False,
+                strategy_name="six_signal_confluence_scalper_strict_jpy_trend",
             ),
             "lion_usdchf_actual": LionOfJudahFiveSignalStrategy(
                 use_trend=True,
