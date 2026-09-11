@@ -39,10 +39,14 @@ def build_data_for_symbol(symbol, broker=None):
     return FeatureEngine().add_features(df)
 
 
-def latest_signal(symbol, data, router):
+def latest_signal(symbol, data, router, spread_points=None):
     strategy = router.get_strategy(symbol)
+    evaluate_latest = getattr(strategy, "evaluate_latest", None)
+    if callable(evaluate_latest):
+        signal, score, score_components = evaluate_latest(data, spread_points=spread_points)
+        return int(signal), strategy, int(score), score_components
     signal_series = strategy.generate_signals(data)
-    return int(signal_series.iloc[-1]), strategy
+    return int(signal_series.iloc[-1]), strategy, None, {}
 
 
 def resolve_live_symbol(broker, symbol, dry_run):
@@ -562,12 +566,27 @@ def main():
                     cycle_counts["revenge_waiting"] += 1
                     continue
 
-                signal, strategy = latest_signal(symbol, data, router)
+                live_tick = None
+                spread_points = None
+                if broker and not args.dry_run:
+                    live_tick = broker.symbol_tick(broker_symbol)
+                    if live_tick is not None:
+                        info = broker.symbol_info(broker_symbol)
+                        point = float(getattr(info, "point", 0.0) or 0.0) if info is not None else 0.0
+                        if point > 0 and getattr(live_tick, "ask", None) is not None and getattr(live_tick, "bid", None) is not None:
+                            spread_points = (float(live_tick.ask) - float(live_tick.bid)) / point
+
+                signal, strategy, signal_score, score_components = latest_signal(
+                    symbol,
+                    data,
+                    router,
+                    spread_points=spread_points,
+                )
                 atr = float(data["atr"].iloc[-1])
                 broker_time = data.index[-1].to_pydatetime()
 
                 if broker and not args.dry_run:
-                    tick = broker.symbol_tick(broker_symbol)
+                    tick = live_tick
                     if tick is None:
                         print(f"{symbol}: no live tick available")
                         append_jsonl(run_log, {"event": "skip", "symbol": symbol, "reason": "no_tick", "broker_time": broker_time})
@@ -580,7 +599,10 @@ def main():
                     equity = rules.initial_balance
 
                 if signal == 0:
-                    print(f"{symbol}: no trade (no_signal)")
+                    if signal_score is None:
+                        print(f"{symbol}: no trade (no_signal)")
+                    else:
+                        print(f"{symbol}: no trade (score={signal_score}/5)")
                     cycle_counts["skip_no_signal"] += 1
                     append_jsonl(
                         run_log,
@@ -596,6 +618,7 @@ def main():
                     continue
 
                 strategy_plan = None
+                risk_per_trade = rules.max_risk_per_trade_pct
                 analyze_trade = getattr(strategy, "analyze_trade", None)
                 if callable(analyze_trade):
                     try:
@@ -619,6 +642,9 @@ def main():
                     size_reason = strategy_plan.get("size_reason", "strategy_plan")
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
+                    risk_fraction = getattr(strategy, "risk_fraction", None)
+                    if callable(risk_fraction) and signal_score is not None:
+                        risk_per_trade = float(risk_fraction(signal_score))
 
                     if broker and not args.dry_run:
                         stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
@@ -643,11 +669,17 @@ def main():
                             entry_price=price,
                             stop_price=stop,
                             account_equity=equity,
-                            risk_per_trade=rules.max_risk_per_trade_pct,
+                            risk_per_trade=risk_per_trade,
                             size_multiplier=revenge_context["multiplier"],
                         )
                     else:
-                        size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
+                        size = risk.calculate_position_size(
+                            equity,
+                            price,
+                            stop,
+                            atr=atr,
+                            risk_per_trade=risk_per_trade,
+                        ) * revenge_context["multiplier"]
                         size_reason = "dry_run"
 
                 if size <= 0:
@@ -658,6 +690,7 @@ def main():
 
                 print(
                     f"{symbol}: strategy={strategy.__class__.__name__} signal={signal} "
+                    f"score={signal_score}/5 risk={risk_per_trade * 100:.2f}% "
                     f"price={price:.5f} size={size:.2f} sl={stop:.5f} tp={target:.5f}"
                 )
                 append_jsonl(
@@ -667,6 +700,9 @@ def main():
                         "symbol": symbol,
                         "strategy": strategy.__class__.__name__,
                         "signal": signal,
+                        "score": signal_score,
+                        "score_components": score_components,
+                        "risk_per_trade": risk_per_trade,
                         "price": price,
                         "size": size,
                         "stop": stop,
