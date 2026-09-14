@@ -7,7 +7,7 @@ class MeanReversion(BaseStrategy):
         self,
         lookback=20,
         entry_z=2.0,
-        min_score=3,
+        min_score=4,
         max_spread_points=30,
     ):
         self.lookback = lookback
@@ -141,15 +141,17 @@ class MeanReversion(BaseStrategy):
             ranging=ranging,
             spread_volatility=spread_volatility,
         )
-        signal = direction if score >= self.min_score else 0
+        core_confirmed = all(
+            components.get(name, False)
+            for name in ("z_extreme", "z_turning", "reversal_candle", "m15_ranging")
+        )
+        signal = direction if score >= self.min_score and core_confirmed else 0
         return signal, score, components
 
     @staticmethod
     def risk_fraction(score):
         if score >= 4:
             return 0.025
-        if score >= 3:
-            return 0.02
         return 0.0
 
     def generate_signals(self, data: pd.DataFrame):
@@ -161,13 +163,19 @@ class MeanReversion(BaseStrategy):
         spread_volatility = self._spread_volatility_series(df)
 
         for i in range(self.lookback + 1, len(df)):
-            signal, _, _ = self._score_at(
+            signal, _, components = self._score_at(
                 df,
                 i,
                 z=z,
                 ranging=ranging,
                 spread_volatility=spread_volatility,
             )
-            signals.iloc[i] = signal
+            if signal == 0:
+                continue
+            if all(
+                components.get(name, False)
+                for name in ("z_extreme", "z_turning", "reversal_candle", "m15_ranging")
+            ):
+                signals.iloc[i] = signal
 
         return signals

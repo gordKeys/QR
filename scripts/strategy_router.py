@@ -12,7 +12,7 @@ class StrategyRouter:
     def __init__(self):
         self.registry = {
             "mean_reversion": MeanReversion(lookback=20, entry_z=1.5),
-            "mean_reversion_strict": MeanReversion(lookback=30, entry_z=2.0),
+            "mean_reversion_strict": MeanReversion(lookback=30, entry_z=2.0, min_score=4),
             "momentum": Momentum(),
             "trend": TrendFollowing(),
             "volatility_breakout": VolatilityBreakout(),
