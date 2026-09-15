@@ -1,0 +1,4 @@
+{"event": "cycle_start", "time": "2026-09-14 19:19:29.520762+00:00"}
+{"event": "signal", "symbol": "GBPUSD", "strategy": "MeanReversion", "signal": -1, "score": 4, "score_components": {"z_extreme": true, "z_turning": true, "reversal_candle": true, "m15_ranging": true, "spread_volatility": false, "previous_z": 2.818104543275531, "current_z": 2.2713925640674137}, "risk_per_trade": 0.025, "price": 1.33751, "size": 291120.81513827585, "stop": 1.3392275, "target": 1.33522, "equity": 10000, "size_reason": "dry_run", "revenge_mode": false, "revenge_stage": null, "revenge_boosted": false, "broker_time": "2026-07-02 15:45:00"}
+{"event": "cycle_summary", "time": "2026-09-14 19:19:29.554591+00:00", "summary": {"signals": 1}}
+{"event": "runner_stop", "time": "2026-09-14 19:19:29.554777+00:00"}

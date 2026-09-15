@@ -260,6 +260,12 @@ def main():
     parser.add_argument("--account-type", choices=[ACCOUNT_TYPE_STANDARD, "SWING"], default=ACCOUNT_TYPE_STANDARD)
     parser.add_argument("--ftmo-initial-capital", type=float, default=0.0)
     parser.add_argument("--market-close-buffer-minutes", type=int, default=5)
+    parser.add_argument("--news-calendar-url", type=str, default=None)
+    parser.add_argument("--news-pre-minutes", type=int, default=5)
+    parser.add_argument("--news-post-minutes", type=int, default=10)
+    parser.add_argument("--max-spread-points", type=float, default=30.0)
+    parser.add_argument("--max-candle-atr", type=float, default=2.5)
+    parser.add_argument("--max-atr-ratio", type=float, default=3.0)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -313,6 +319,12 @@ def main():
                         account_type=args.account_type,
                         initial_balance=args.ftmo_initial_capital or live_balance or live_equity,
                         market_close_buffer_minutes=args.market_close_buffer_minutes,
+                        news_calendar_url=args.news_calendar_url or FTMOComplianceConfig().news_calendar_url,
+                        news_pre_minutes=args.news_pre_minutes,
+                        news_post_minutes=args.news_post_minutes,
+                        max_spread_points=args.max_spread_points,
+                        max_candle_atr=args.max_candle_atr,
+                        max_atr_ratio=args.max_atr_ratio,
                     )
                 )
         except MT5UnavailableError as exc:
@@ -609,6 +621,7 @@ def main():
                 signal, strategy = latest_signal(symbol, data, router)
                 atr = float(data["atr"].iloc[-1])
                 broker_time = data.index[-1].to_pydatetime()
+                spread_points = None
 
                 if broker and not args.dry_run:
                     tick = broker.symbol_tick(broker_symbol)
@@ -617,6 +630,10 @@ def main():
                         append_jsonl(run_log, {"event": "skip", "symbol": symbol, "reason": "no_tick", "broker_time": broker_time})
                         cycle_counts["skip_no_tick"] += 1
                         continue
+                    info = broker.symbol_info(broker_symbol)
+                    point = float(getattr(info, "point", 0.0) or 0.0) if info is not None else 0.0
+                    if point > 0 and getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
+                        spread_points = (float(tick.ask) - float(tick.bid)) / point
                     price = float(tick.ask if signal == 1 else tick.bid)
                     equity = broker.account_equity() or rules.initial_balance
                 else:
@@ -640,7 +657,14 @@ def main():
                     continue
 
                 if compliance is not None:
-                    compliance_block = compliance.should_block_new_entry(symbol, started)
+                    market_block = compliance.execution_market_guard(
+                        broker_symbol,
+                        spread_points=spread_points,
+                        candle_range=float(data["high"].iloc[-1] - data["low"].iloc[-1]),
+                        atr=atr,
+                        typical_atr=float(data["atr"].tail(50).median()),
+                    )
+                    compliance_block = market_block or compliance.should_block_new_entry(symbol, started)
                     if compliance_block:
                         reason = compliance_block["reason"]
                         print(f"{symbol}: blocked by FTMO compliance ({reason})")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -11,6 +13,8 @@ ACCOUNT_TYPE_STANDARD = "STANDARD"
 ACCOUNT_TYPE_SWING = "SWING"
 PRAGUE_TZ = ZoneInfo("Europe/Prague")
 GHANA_TZ = ZoneInfo("Africa/Accra")
+LONDON_TZ = ZoneInfo("Europe/London")
+DEFAULT_CALENDAR_URL = "https://www.forexfactory.com/calendar?week=this&export=xml"
 
 
 @dataclass
@@ -23,6 +27,12 @@ class FTMOComplianceConfig:
     market_close_buffer_minutes: int = 5
     ghana_no_entry_start_hour: int = 19
     ghana_no_entry_end_hour: int = 1
+    news_calendar_url: str = DEFAULT_CALENDAR_URL
+    news_pre_minutes: int = 5
+    news_post_minutes: int = 10
+    max_spread_points: float = 30.0
+    max_candle_atr: float = 2.5
+    max_atr_ratio: float = 3.0
 
 
 class FTMOComplianceEngine:
@@ -36,6 +46,8 @@ class FTMOComplianceEngine:
         self.daily_base = self.total_base = None
         self.daily_limit = self.total_limit = None
         self.seconds_to_reset = None
+        self._news_cache = []
+        self._news_cache_time = None
 
     def _load_state(self):
         try:
@@ -114,6 +126,64 @@ class FTMOComplianceEngine:
         overnight_window = now.weekday() in (1, 2, 3, 4, 5) and now.hour < self.config.ghana_no_entry_end_hour
         return evening_window or overnight_window
 
+    def _news_events(self):
+        now = datetime.now(timezone.utc)
+        if self._news_cache_time and now - self._news_cache_time < timedelta(minutes=15):
+            return self._news_cache
+        try:
+            with urllib.request.urlopen(self.config.news_calendar_url, timeout=8) as response:
+                root = ET.fromstring(response.read())
+        except Exception:
+            self._news_cache = []
+            self._news_cache_time = now
+            return []
+        events = []
+        for item in root.findall('.//event'):
+            impact = (item.findtext('impact') or '').strip().upper()
+            currency = (item.findtext('currency') or item.findtext('country') or '').strip().upper()
+            title = (item.findtext('title') or item.findtext('description') or '').strip()
+            date_text = (item.findtext('date') or '').strip()
+            time_text = (item.findtext('time') or '').strip().lower().replace('.', '')
+            if 'HIGH' not in impact or not currency or not title or not date_text or not time_text:
+                continue
+            try:
+                event_date = datetime.strptime(date_text, '%m/%d/%Y').date()
+                event_time = datetime.strptime(time_text, '%I:%M%p').time()
+            except ValueError:
+                continue
+            event_dt = datetime.combine(event_date, event_time, tzinfo=LONDON_TZ).astimezone(timezone.utc)
+            events.append({'time': event_dt, 'currency': currency, 'title': title})
+        self._news_cache = events
+        self._news_cache_time = now
+        return events
+
+    @staticmethod
+    def _news_affects_symbol(symbol, currency):
+        symbol = symbol.upper()
+        return currency in symbol or (currency == 'USD' and 'XAU' in symbol)
+
+    def news_blackout(self, symbol, now_utc=None):
+        if self.config.account_type.upper() != ACCOUNT_TYPE_STANDARD:
+            return None
+        now_utc = now_utc or datetime.now(timezone.utc)
+        before = timedelta(minutes=self.config.news_pre_minutes)
+        after = timedelta(minutes=self.config.news_post_minutes)
+        for event in self._news_events():
+            if not self._news_affects_symbol(symbol, event['currency']):
+                continue
+            if event['time'] - before <= now_utc <= event['time'] + after:
+                return {'reason': 'news_blackout', 'event': event}
+        return None
+
+    def execution_market_guard(self, symbol, *, spread_points=None, candle_range=None, atr=None, typical_atr=None):
+        if spread_points is not None and spread_points > self.config.max_spread_points:
+            return {'reason': 'spread_too_wide', 'spread_points': spread_points}
+        if atr and candle_range is not None and candle_range > atr * self.config.max_candle_atr:
+            return {'reason': 'abnormal_candle_range', 'candle_range': candle_range, 'atr': atr}
+        if atr and typical_atr and atr > typical_atr * self.config.max_atr_ratio:
+            return {'reason': 'volatility_spike', 'atr': atr, 'typical_atr': typical_atr}
+        return None
+
     def should_block_new_entry(self, symbol, now_utc=None):
         if self.is_loss_limit_breached():
             return {"reason": "loss_limit_breached"}
@@ -121,6 +191,9 @@ class FTMOComplianceEngine:
             return {"reason": "market_closed"}
         if self.ghana_no_entry_window(now_utc):
             return {"reason": "ghana_no_entry_window"}
+        news_state = self.news_blackout(symbol, now_utc)
+        if news_state:
+            return news_state
         return None
 
     def should_flatten_position(self, symbol, now_utc=None):
