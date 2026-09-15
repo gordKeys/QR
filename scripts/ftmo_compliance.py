@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 ACCOUNT_TYPE_STANDARD = "STANDARD"
 ACCOUNT_TYPE_SWING = "SWING"
 PRAGUE_TZ = ZoneInfo("Europe/Prague")
+GHANA_TZ = ZoneInfo("Africa/Accra")
 
 
 @dataclass
@@ -20,6 +21,8 @@ class FTMOComplianceConfig:
     max_total_loss_pct: float = 10.0
     state_path: Path = Path("logs/ftmo_compliance_state.json")
     market_close_buffer_minutes: int = 5
+    ghana_no_entry_start_hour: int = 19
+    ghana_no_entry_end_hour: int = 1
 
 
 class FTMOComplianceEngine:
@@ -105,11 +108,19 @@ class FTMOComplianceEngine:
             return True
         return now.weekday() == 0 and now.hour == 0 and now.minute < buffer
 
+    def ghana_no_entry_window(self, now_utc=None):
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(GHANA_TZ)
+        evening_window = now.weekday() in (0, 1, 2, 3, 4) and now.hour >= self.config.ghana_no_entry_start_hour
+        overnight_window = now.weekday() in (1, 2, 3, 4, 5) and now.hour < self.config.ghana_no_entry_end_hour
+        return evening_window or overnight_window
+
     def should_block_new_entry(self, symbol, now_utc=None):
         if self.is_loss_limit_breached():
             return {"reason": "loss_limit_breached"}
         if self.platform_market_closed(now_utc):
             return {"reason": "market_closed"}
+        if self.ghana_no_entry_window(now_utc):
+            return {"reason": "ghana_no_entry_window"}
         return None
 
     def should_flatten_position(self, symbol, now_utc=None):

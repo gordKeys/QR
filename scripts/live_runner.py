@@ -22,7 +22,6 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 
 BOT_MAGIC = 26072026
-from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOComplianceEngine
 
 
 def build_data_for_symbol(symbol, broker=None):
