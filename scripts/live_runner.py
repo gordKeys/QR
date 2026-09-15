@@ -18,6 +18,11 @@ from revenge_mode import RevengeTradeManager
 from live_protection import HardDrawdownGuard, SymbolCircuitBreaker
 from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
+from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOComplianceEngine
+
+
+BOT_MAGIC = 26072026
+from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOComplianceEngine
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -100,6 +105,10 @@ def format_status(symbol, consecutive_losses, cooldown_until, last_closed_pnl):
         f"cooldown_remaining={cooldown_text} | "
         f"last_closed_pnl={pnl_text}"
     )
+
+
+def filter_owned_positions(positions):
+    return [position for position in positions if getattr(position, "magic", None) == BOT_MAGIC]
 
 
 def calculate_trade_volume(
@@ -226,6 +235,13 @@ def update_trade_mfe(trade_states, position, new_profit, state_key=None):
     return False, state
 
 
+def format_countdown(seconds):
+    if seconds is None:
+        return "n/a"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
@@ -242,6 +258,9 @@ def main():
     parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
     parser.add_argument("--break-even-trigger-pct", type=float, default=1.0)
     parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
+    parser.add_argument("--account-type", choices=[ACCOUNT_TYPE_STANDARD, "SWING"], default=ACCOUNT_TYPE_STANDARD)
+    parser.add_argument("--ftmo-initial-capital", type=float, default=0.0)
+    parser.add_argument("--market-close-buffer-minutes", type=int, default=5)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -264,6 +283,7 @@ def main():
     active_positions = 0
     hard_drawdown_day = None
     reference_balance = rules.initial_balance
+    compliance = None
 
     print(f"Revenge mode: {'ON' if args.revenge_mode else 'OFF'}")
     if args.revenge_mode:
@@ -275,6 +295,7 @@ def main():
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
     print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
+    print(f"FTMO account type: {args.account_type}")
 
     broker = None
     if not args.dry_run:
@@ -282,10 +303,19 @@ def main():
             broker = MT5BrokerAdapter()
             broker.initialize()
             last_deal_check = datetime.now(timezone.utc) - timedelta(minutes=5)
-            live_equity = broker.account_equity()
-            if live_equity is not None:
+            account_info = broker.mt5.account_info()
+            live_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
+            live_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
+            if live_equity is not None and live_equity > 0:
                 hard_drawdown.reset_session(live_equity)
-                reference_balance = live_equity
+                reference_balance = live_balance or live_equity
+                compliance = FTMOComplianceEngine(
+                    FTMOComplianceConfig(
+                        account_type=args.account_type,
+                        initial_balance=args.ftmo_initial_capital or live_balance or live_equity,
+                        market_close_buffer_minutes=args.market_close_buffer_minutes,
+                    )
+                )
         except MT5UnavailableError as exc:
             print(f"MT5 unavailable, falling back to dry-run: {exc}")
             args.dry_run = True
@@ -325,8 +355,20 @@ def main():
             append_jsonl(run_log, {"event": "cooldown_lifted", "time": started})
 
         if broker and not args.dry_run:
-            current_equity = broker.account_equity()
-            if current_equity is not None:
+            account_info = broker.mt5.account_info()
+            current_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
+            current_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
+            if current_equity is not None and current_balance is not None:
+                if compliance is not None:
+                    report = compliance.refresh_account(balance=current_balance, equity=current_equity, now_utc=started)
+                    print(
+                        f"FTMO | Prague={report['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"DayResetIn={format_countdown(report['seconds_to_reset'])} | "
+                        f"DailyBase=${report['daily_base']:.2f} | DailyMaxLoss=${report['daily_loss_amount']:.2f} | "
+                        f"DailyLimit=${report['daily_limit']:.2f} | DailyBuf=${report['daily_buffer']:+.2f} | "
+                        f"TotalBase=${report['total_base']:.2f} | TotalMaxLoss=${report['total_loss_amount']:.2f} | "
+                        f"TotalLimit=${report['total_limit']:.2f} | TotalBuf=${report['total_buffer']:+.2f}"
+                    )
                 if hard_drawdown_day != current_day:
                     hard_drawdown.reset_day(current_equity)
                     hard_drawdown_day = current_day
@@ -344,7 +386,7 @@ def main():
                 session_pnl = current_equity - reference_balance
                 pnl_pct = (session_pnl / reference_balance * 100.0) if reference_balance else 0.0
                 print(
-                    f"ACCOUNT | balance=${current_equity:.2f} | "
+                    f"ACCOUNT | balance=${current_balance:.2f} | equity=${current_equity:.2f} | "
                     f"PnL=${session_pnl:+.2f} ({pnl_pct:+.2f}%) | "
                     f"ref_balance=${reference_balance:.2f}"
                 )
@@ -459,9 +501,19 @@ def main():
                     continue
 
                 if broker and not args.dry_run:
-                    positions = broker.positions_get(symbol=broker_symbol)
+                    positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                     if positions:
                         current_position = positions[0]
+                        compliance_action = compliance.should_flatten_position(symbol, started) if compliance else None
+                        if compliance_action:
+                            reason = compliance_action["reason"]
+                            result = broker.close_position(current_position, comment=f"FTMO {reason}")
+                            accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                            print(f"{symbol}: FTMO forced close reason={reason} result={result}")
+                            append_jsonl(run_log, {"event": "ftmo_forced_close", "symbol": symbol, "ticket": getattr(current_position, "ticket", None), "reason": reason, "accepted": accepted, "result": str(result), "broker_time": started})
+                            if accepted:
+                                cycle_counts["ftmo_forced_closes"] += 1
+                                continue
                         state = ensure_trade_state(trade_states, current_position, state_key=symbol)
                         current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
                         updated, state = update_trade_mfe(trade_states, current_position, current_profit, state_key=symbol)
@@ -587,6 +639,15 @@ def main():
                         },
                     )
                     continue
+
+                if compliance is not None:
+                    compliance_block = compliance.should_block_new_entry(symbol, started)
+                    if compliance_block:
+                        reason = compliance_block["reason"]
+                        print(f"{symbol}: blocked by FTMO compliance ({reason})")
+                        append_jsonl(run_log, {"event": "ftmo_entry_blocked", "symbol": symbol, "reason": reason, "broker_time": broker_time})
+                        cycle_counts["ftmo_entry_blocked"] += 1
+                        continue
 
                 strategy_plan = None
                 analyze_trade = getattr(strategy, "analyze_trade", None)
