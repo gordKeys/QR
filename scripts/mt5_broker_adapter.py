@@ -242,3 +242,34 @@ class MT5BrokerAdapter:
         if take_profit is not None:
             request["tp"] = self.normalize_price(symbol, take_profit)
         return self.mt5.order_send(request)
+
+    def close_position(self, position, comment="FTMO compliance"):
+        position_type = getattr(position, "type", None)
+        buy_type = getattr(self.mt5, "POSITION_TYPE_BUY", 0)
+        direction = -1 if position_type == buy_type else 1
+        tick = self.symbol_info_tick(position.symbol)
+        if tick is None:
+            return None
+        price = tick.bid if direction == -1 else tick.ask
+        request = {
+            "action": self.mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": float(getattr(position, "volume", 0.0) or 0.0),
+            "type": self.mt5.ORDER_TYPE_SELL if direction == -1 else self.mt5.ORDER_TYPE_BUY,
+            "position": int(getattr(position, "ticket", 0)),
+            "price": self.normalize_price(position.symbol, price),
+            "deviation": 20,
+            "magic": 26072026,
+            "comment": comment,
+            "type_time": self.mt5.ORDER_TIME_GTC,
+        }
+        last_result = None
+        invalid_fill = getattr(self.mt5, "TRADE_RETCODE_INVALID_FILL", 10030)
+        for fill_mode in self.filling_modes(position.symbol):
+            request["type_filling"] = fill_mode
+            last_result = self.mt5.order_send(request)
+            if last_result is not None and getattr(last_result, "retcode", None) == self.mt5.TRADE_RETCODE_DONE:
+                return last_result
+            if last_result is not None and getattr(last_result, "retcode", None) != invalid_fill:
+                break
+        return last_result
