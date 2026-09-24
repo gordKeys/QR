@@ -18,8 +18,9 @@ class MT5BrokerAdapter:
 
         self.mt5 = mt5
 
-    def initialize(self):
-        if not self.mt5.initialize():
+    def initialize(self, path=None):
+        initialized = self.mt5.initialize(path=path) if path else self.mt5.initialize()
+        if not initialized:
             raise RuntimeError(f"MT5 initialize failed: {self.mt5.last_error()}")
 
     def shutdown(self):

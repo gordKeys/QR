@@ -270,6 +270,7 @@ def main():
     parser.add_argument("--max-spread-points", type=float, default=30.0)
     parser.add_argument("--max-candle-atr", type=float, default=2.5)
     parser.add_argument("--max-atr-ratio", type=float, default=3.0)
+    parser.add_argument("--mt5-path", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe")
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -310,9 +311,16 @@ def main():
     if not args.dry_run:
         try:
             broker = MT5BrokerAdapter()
-            broker.initialize()
+            broker.initialize(path=args.mt5_path)
             last_deal_check = datetime.now(timezone.utc) - timedelta(minutes=5)
             account_info = broker.mt5.account_info()
+            if account_info is not None:
+                print(
+                    "MT5 ACCOUNT | "
+                    f"login={getattr(account_info, 'login', 'n/a')} | "
+                    f"server={getattr(account_info, 'server', 'n/a')} | "
+                    f"company={getattr(account_info, 'company', 'n/a')}"
+                )
             live_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
             live_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
             if live_equity is not None and live_equity > 0:
