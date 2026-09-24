@@ -51,6 +51,11 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, help="Live mode only")
     parser.add_argument("--hard-drawdown-switch", action="store_true", help="Live mode only")
     parser.add_argument("--hard-drawdown-usd", type=float, help="Live mode only")
+    parser.add_argument(
+        "--mt5-path",
+        default=r"C:\Program Files\MetaTrader 5\terminal64.exe",
+        help="Explicit MT5 terminal executable path for live mode",
+    )
     parser.add_argument("--use-mt5-costs", action="store_true", help="MTF/patterns mode only")
     parser.add_argument("--entry-style", choices=["breakout", "retest"], help="Patterns mode only")
     parser.add_argument("--strategies", nargs="+", help="Patterns mode only")
@@ -127,6 +132,8 @@ def main():
             live_args.append("--hard-drawdown-switch")
         if args.hard_drawdown_usd is not None:
             live_args.extend(["--hard-drawdown-usd", str(args.hard_drawdown_usd)])
+        if args.mt5_path:
+            live_args.extend(["--mt5-path", args.mt5_path])
         if not live_args:
             live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
         return run_script("live_runner.py", live_args)
