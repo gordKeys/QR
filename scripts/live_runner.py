@@ -780,10 +780,24 @@ def main():
                 cycle_counts["signals"] += 1
 
                 if broker and not args.dry_run:
-                    active_positions = broker.positions_total(symbol)
-                    if active_positions >= 1:
-                        print(f"{symbol}: skipped because position already open")
-                        cycle_counts["skip_open_position"] += 1
+                    owned_positions = filter_owned_positions(broker.positions_get())
+                    total_owned_positions = len(owned_positions)
+                    if total_owned_positions >= rules.max_open_positions:
+                        print(
+                            f"{symbol}: skipped because global max open positions reached "
+                            f"({total_owned_positions}/{rules.max_open_positions})"
+                        )
+                        cycle_counts["skip_max_open_positions"] += 1
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "skip_max_open_positions",
+                                "symbol": symbol,
+                                "owned_positions": total_owned_positions,
+                                "max_open_positions": rules.max_open_positions,
+                                "broker_time": broker_time,
+                            },
+                        )
                         continue
                     result = broker.place_order(
                         symbol=broker_symbol,
