@@ -247,7 +247,7 @@ class MT5BrokerAdapter:
     def close_position(self, position, comment="FTMO compliance"):
         buy_type = getattr(self.mt5, "POSITION_TYPE_BUY", 0)
         direction = -1 if getattr(position, "type", None) == buy_type else 1
-        tick = self.symbol_info_tick(position.symbol)
+        tick = self.symbol_tick(position.symbol)
         if tick is None:
             return None
         price = tick.bid if direction == -1 else tick.ask
