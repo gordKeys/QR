@@ -2,7 +2,7 @@
 Sell Gun -- MT5 (HFM)
 ======================
 
-Opens as many SELL positions on XAUUSD as the account can support, sized so
+Opens as many SELL positions on GOLD as the account can support, sized so
 that after opening them, the account has enough FREE margin/equity to
 survive an adverse swing until they hit their SL or TP. Same sizing logic
 as buy_gun.py, mirrored for the short side (SL above entry, TP below entry,
@@ -28,16 +28,16 @@ except Exception:
 
 
 # ===================== YOUR HFM LOGIN (fill these in) ========================
-MT5_LOGIN = 261046570                # your HFM account number
+MT5_LOGIN = 1302211830                # your HFM account number
 MT5_PASSWORD = "Gordonpap@2023"           # <-- your HFM password
-MT5_SERVER = "HFMarketsGlobal-Live20"             # e.g. "HFMarketsGlobal-Live" or "HFMarketsGlobal-Demo"
+MT5_SERVER = "XMGlobal-MT5 6"             # e.g. "HFMarketsGlobal-Live" or "HFMarketsGlobal-Demo"
 # Leave MT5_PASSWORD blank to just attach to an MT5 terminal that's already
 # open and logged in, instead of logging in from the script.
 
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 # ============================== SETTINGS =====================================
-BASE_SYMBOL = "XAUUSD"        # base instrument name -- actual broker symbol is auto-resolved
+BASE_SYMBOL = "GOLD"        # base instrument name -- actual broker symbol is auto-resolved
 DIRECTION = mt5.ORDER_TYPE_SELL if mt5 else 1
 
 MAX_TRADES = 50               # hard ceiling regardless of what the math allows
@@ -89,7 +89,7 @@ def connect() -> bool:
 def resolve_symbol(base: str):
     """
     Find the broker's actual symbol name for `base`, whatever prefix/suffix it
-    uses (e.g. XAUUSD -> XAUUSDm, XAUUSD.raw, m.XAUUSD, GOLDm, ...).
+    uses (e.g. GOLD -> GOLDm, GOLD.raw, m.GOLD, GOLDm, ...).
     Preference order: exact match > shortest name containing base as a
     substring (fewest extra prefix/suffix chars) > first visible match.
     """
