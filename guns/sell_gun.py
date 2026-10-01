@@ -1,130 +1,97 @@
 """
-Sell Gun -- MT5 (HFM)
-======================
+Sell Gun -- MT5 (XM)
+Opens as many SELL positions on gold (XAUUSD) as the account allows, each with
+its own SL and TP. Works on any account type (demo or real) -- no gate.
 
-Opens as many SELL positions on GOLD as the account can support, sized so
-that after opening them, the account has enough FREE margin/equity to
-survive an adverse swing until they hit their SL or TP. Same sizing logic
-as buy_gun.py, mirrored for the short side (SL above entry, TP below entry,
-priced off the bid).
-
-Honest note, same as buy_gun.py: selling with no signal has no expected
-edge -- direction is a coin flip, so over time this costs you spread +
-commission. All positions are correlated (same direction), so if price
-moves against you, they lose together. TEST ON DEMO FIRST.
-
-Deps (Windows MT5 machine):  pip install MetaTrader5 pandas numpy
+Count = min(margin cap, risk cap, MAX_TRADES).
+Deps: pip install MetaTrader5 pandas numpy
 """
-
-import sys
+import os, sys, time
 from datetime import datetime, timezone
-
 import pandas as pd
+import MetaTrader5 as mt5
 
-try:
-    import MetaTrader5 as mt5
-except Exception:
-    mt5 = None
-
-
-# ===================== YOUR HFM LOGIN (fill these in) ========================
-MT5_LOGIN = 1302211830                # your HFM account number
-MT5_PASSWORD = "Gordonpap@2023"           # <-- your HFM password
-MT5_SERVER = "XMGlobal-MT5 6"             # e.g. "HFMarketsGlobal-Live" or "HFMarketsGlobal-Demo"
-# Leave MT5_PASSWORD blank to just attach to an MT5 terminal that's already
-# open and logged in, instead of logging in from the script.
-
+# ============================ LOGIN ==========================================
+MT5_LOGIN = 1302211830                 # your XM account number
+MT5_PASSWORD = "Gordonpap@2023"          # your XM password (blank = attach to open, logged-in terminal)
+MT5_SERVER = "XMGlobal-MT5 6"
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
-# ============================== SETTINGS =====================================
-BASE_SYMBOL = "GOLD"        # base instrument name -- actual broker symbol is auto-resolved
-DIRECTION = mt5.ORDER_TYPE_SELL if mt5 else 1
+# ============================ SETTINGS =======================================
+SYMBOL_OVERRIDE = ""                       # exact XM name if you want to force one, e.g. "GOLD"
+SYMBOL_CANDIDATES = ["XAUUSD", "GOLD"]     # tried in order, EXACT names only (XM often calls it GOLD)
 
-MAX_TRADES = 50               # hard ceiling regardless of what the math allows
-LOT = 0.01                    # fixed lot per position (check the symbol's min lot)
-MARGIN_USE_TARGET = 0.70      # use up to this fraction of equity as MARGIN across
-                              # all positions opened; the rest stays FREE
-BATCH_RISK_CAP = 1.00         # batch's worst-case loss at SL must stay under this
-                              # fraction of equity (1.00 = never risk more than the account)
+DIRECTION = mt5.ORDER_TYPE_SELL
+MAGIC = 130014
+MAX_TRADES = 500
+LOT = 0.01
+MARGIN_USE_TARGET = 0.70    # fraction of equity usable as margin for the whole batch
+BATCH_RISK_CAP = 1.00       # batch worst-case loss at SL as fraction of equity
 
-SL_ATR_MULT = 1.5             # stop distance  = this * ATR
-TP_ATR_MULT = 12.0            # target distance = this * ATR
+SL_ATR_MULT = 1.5
+TP_ATR_MULT = 12.0
 ATR_PERIOD = 14
 ATR_TF = "H1"
 
-FORCE_LIVE_ON_REAL = True    # safety: must be flipped to True to trade on a REAL account
-
-TF_MAP = {
-    "M15": getattr(mt5, "TIMEFRAME_M15", 15) if mt5 else 15,
-    "H1": getattr(mt5, "TIMEFRAME_H1", 16385) if mt5 else 16385,
-    "H4": getattr(mt5, "TIMEFRAME_H4", 16388) if mt5 else 16388,
-}
+TF_MAP = {"M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4}
 
 
 def log(*a):
-    print(f"[{datetime.now(timezone.utc):%H:%M:%S}Z]", *a)
+    print(f"[{datetime.now(timezone.utc):%H:%M:%S}Z]", *a, flush=True)
 
 
-def connect() -> bool:
-    if mt5 is None:
-        print("[FATAL] MetaTrader5 not importable. On the Windows MT5 machine: "
-              "pip install MetaTrader5")
-        return False
+def connect():
     kw = {"path": TERMINAL_PATH}
     if MT5_PASSWORD:
         kw.update(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
     if not mt5.initialize(**kw):
-        print(f"[FATAL] initialize failed: {mt5.last_error()} -- check login/password/server "
-              f"or open MT5 and log in first.")
+        log(f"initialize failed: {mt5.last_error()}")
         return False
     info = mt5.account_info()
     if info is None:
-        print(f"[FATAL] no account_info: {mt5.last_error()}")
+        log(f"no account_info: {mt5.last_error()}")
         return False
-    log(f"Connected {info.login} | {info.server} | bal {info.balance} {info.currency} | "
-        f"{'DEMO' if info.trade_mode == 0 else 'REAL/other'}")
+    log(f"Connected {info.login} | {info.server} | bal {info.balance} {info.currency}")
     return True
 
 
-def resolve_symbol(base: str):
-    """
-    Find the broker's actual symbol name for `base`, whatever prefix/suffix it
-    uses (e.g. GOLD -> GOLDm, GOLD.raw, m.GOLD, GOLDm, ...).
-    Preference order: exact match > shortest name containing base as a
-    substring (fewest extra prefix/suffix chars) > first visible match.
-    """
-    all_syms = mt5.symbols_get()
-    if not all_syms:
-        log("could not fetch symbol list from broker")
+def resolve_symbol():
+    names = {s.name.upper(): s.name for s in (mt5.symbols_get() or [])}
+    tries = [SYMBOL_OVERRIDE] if SYMBOL_OVERRIDE else SYMBOL_CANDIDATES
+    chosen = None
+    for t in tries:
+        if t.upper() in names:
+            chosen = names[t.upper()]
+            break
+    if chosen is None and not SYMBOL_OVERRIDE:
+        # suffixed variants like XAUUSD.m / XAUUSD# (starts-with only, never substring)
+        pre = sorted(n for u, n in names.items() if u.startswith("XAUUSD"))
+        chosen = pre[0] if pre else None
+    if chosen is None:
+        log(f"no gold symbol found. Tried {tries}. Gold-like names: "
+            f"{[n for u, n in names.items() if 'XAU' in u or u.startswith('GOLD')]}")
         return None
-
-    base_u = base.upper()
-    candidates = [s.name for s in all_syms if base_u in s.name.upper()]
-    if not candidates:
-        log(f"no symbol containing '{base}' found on this account")
-        return None
-
-    exact = [n for n in candidates if n.upper() == base_u]
-    if exact:
-        chosen = exact[0]
-    else:
-        chosen = sorted(candidates, key=len)[0]  # shortest = least extra prefix/suffix
-
     if not mt5.symbol_select(chosen, True):
-        log(f"found symbol '{chosen}' but could not select it")
+        log(f"could not select {chosen}")
         return None
-
-    if len(candidates) > 1:
-        log(f"resolved '{base}' -> '{chosen}' (other matches on this account: "
-            f"{[c for c in candidates if c != chosen]})")
-    else:
-        log(f"resolved '{base}' -> '{chosen}'")
+    log(f"using symbol '{chosen}'")
     return chosen
 
 
 def current_atr(symbol, tf_key, period):
-    tf = TF_MAP.get(tf_key, TF_MAP["H1"])
-    r = mt5.copy_rates_from_pos(symbol, tf, 0, period + 50)
+    tf = TF_MAP.get(tf_key, mt5.TIMEFRAME_H1)
+    for _ in range(20):                      # wait for a live tick / subscription
+        t = mt5.symbol_info_tick(symbol)
+        if t and t.time:
+            break
+        time.sleep(0.5)
+    r = None
+    for attempt in range(5):                 # wait for history to sync
+        r = mt5.copy_rates_from_pos(symbol, tf, 0, period + 50)
+        if r is not None and len(r) >= period + 2:
+            break
+        log(f"history not ready (attempt {attempt + 1}/5)...")
+        time.sleep(2)
     if r is None or len(r) < period + 2:
         return None
     d = pd.DataFrame(r)
@@ -134,85 +101,81 @@ def current_atr(symbol, tf_key, period):
     return float(tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
 
 
-def compute_batch_size(symbol, sl_dist, lot):
-    """Shared sizing math: how many positions fit under the margin + risk caps."""
-    si = mt5.symbol_info(symbol)
-    acc = mt5.account_info()
-    equity = acc.equity
+def filling_mode(si):
+    fm = si.filling_mode                      # bit 1 = FOK, bit 2 = IOC
+    if fm & 2:
+        return mt5.ORDER_FILLING_IOC
+    if fm & 1:
+        return mt5.ORDER_FILLING_FOK
+    return mt5.ORDER_FILLING_RETURN
+
+
+def compute_batch_size(symbol, si, sl_dist, lot):
+    equity = mt5.account_info().equity
     tick = mt5.symbol_info_tick(symbol)
-
-    margin_each = mt5.order_calc_margin(DIRECTION, symbol, lot, tick.bid)
+    px = tick.bid
+    margin_each = mt5.order_calc_margin(DIRECTION, symbol, lot, px)
     if not margin_each or margin_each <= 0:
-        log("could not compute margin for this symbol; aborting")
-        return None
-
-    risk_each = sl_dist * si.trade_contract_size * lot  # worst-case loss if the stop hits
-
+        log("could not compute margin; aborting")
+        return 0
+    risk_each = sl_dist * si.trade_contract_size * lot
     n_margin = int((equity * MARGIN_USE_TARGET) // margin_each)
     n_risk = int((equity * BATCH_RISK_CAP) // risk_each) if risk_each > 0 else 0
     n = max(0, min(n_margin, n_risk, MAX_TRADES))
-
-    used_margin = margin_each * n
-    batch_loss = risk_each * n
-    log(f"per position: margin ${margin_each:.2f}, worst-case loss ${risk_each:.2f} | equity ${equity:.2f}")
-    log(f"margin cap -> {n_margin} | risk cap -> {n_risk} | opening {n} "
-        f"(margin used ${used_margin:.2f} = {used_margin / equity * 100:.0f}%, "
-        f"free ${equity - used_margin:.2f}; worst-case loss ${batch_loss:.2f} = "
-        f"{batch_loss / equity * 100:.0f}%)")
+    log(f"per position: margin ${margin_each:.2f}, SL loss ${risk_each:.2f} | equity ${equity:.2f}")
+    log(f"margin cap {n_margin} | risk cap {n_risk} | opening {n}")
     return n
 
 
 def open_positions(symbol):
-    if not mt5.symbol_select(symbol, True) or mt5.symbol_info(symbol) is None:
-        log(f"symbol not available: {symbol}")
-        return
     si = mt5.symbol_info(symbol)
     atr = current_atr(symbol, ATR_TF, ATR_PERIOD)
     if not atr or atr <= 0:
         log("could not measure ATR; aborting")
         return
-
     sl_dist, tp_dist = SL_ATR_MULT * atr, TP_ATR_MULT * atr
     lot = round(min(max(LOT, si.volume_min), si.volume_max), 4)
+    log(f"{symbol}: ATR~{atr:.5g} | SL dist {sl_dist:.5g} | TP dist {tp_dist:.5g} | lot {lot}")
 
-    log(f"{symbol}: ATR~{atr:.5g} | SL~{sl_dist:.5g} | TP~{tp_dist:.5g} | lot={lot}")
-
-    n = compute_batch_size(symbol, sl_dist, lot)
+    n = compute_batch_size(symbol, si, sl_dist, lot)
     if not n:
-        log("Can't fit even one position under these limits at this balance. Deposit more, or "
-            "on DEMO raise MARGIN_USE_TARGET / BATCH_RISK_CAP to push it.")
+        log("account can't fit a position under these limits")
         return
 
+    fill = filling_mode(si)
+    ok = 0
     for i in range(n):
         tick = mt5.symbol_info_tick(symbol)
         price = tick.bid
         req = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lot),
-            "type": mt5.ORDER_TYPE_SELL, "price": price,
+            "type": DIRECTION, "price": price,
             "sl": round(price + sl_dist, si.digits),
             "tp": round(price - tp_dist, si.digits),
-            "deviation": 30, "magic": 130014, "comment": "sell_gun",
-            "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC,
+            "deviation": 30, "magic": MAGIC, "comment": "sell_gun",
+            "type_time": mt5.ORDER_TIME_GTC, "type_filling": fill,
         }
         res = mt5.order_send(req)
-        log(f"  sell {i + 1}/{n} -> retcode={res.retcode} {res.comment}")
+        if res is None:
+            log(f"  {i + 1}/{n} -> order_send returned None: {mt5.last_error()}")
+            continue
+        log(f"  {i + 1}/{n} -> retcode={res.retcode} {res.comment}")
+        if res.retcode == mt5.TRADE_RETCODE_DONE:
+            ok += 1
+        elif res.retcode in (mt5.TRADE_RETCODE_NO_MONEY, mt5.TRADE_RETCODE_MARKET_CLOSED,
+                             mt5.TRADE_RETCODE_TRADE_DISABLED, mt5.TRADE_RETCODE_LIMIT_POSITIONS):
+            log("  stopping: broker refuses further orders")
+            break
+    log(f"done: {ok}/{n} positions opened")
 
 
 def main():
     if not connect():
         sys.exit(1)
-    info = mt5.account_info()
-    if info.trade_mode != 0 and not FORCE_LIVE_ON_REAL:
-        log("REAL account -- refusing to place live trades. Test on DEMO, or set "
-            "FORCE_LIVE_ON_REAL = True to allow real orders.")
-        mt5.shutdown()
-        return
     try:
-        symbol = resolve_symbol(BASE_SYMBOL)
-        if not symbol:
-            log(f"could not resolve a broker symbol for '{BASE_SYMBOL}'; aborting")
-            return
-        open_positions(symbol)
+        symbol = resolve_symbol()
+        if symbol:
+            open_positions(symbol)
     finally:
         mt5.shutdown()
 
