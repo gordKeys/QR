@@ -11,8 +11,8 @@ class RiskManager:
         self.max_daily_loss = max_daily_loss
         self.max_drawdown = max_drawdown
 
-    def calculate_position_size(self, balance, entry, stop, atr=None):
-        risk_amount = balance * self.risk_per_trade
+    def calculate_position_size(self, balance, entry, stop, atr=None, risk_per_trade=None):
+        risk_amount = balance * (self.risk_per_trade if risk_per_trade is None else risk_per_trade)
 
         stop_distance = abs(entry - stop)
 

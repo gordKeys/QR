@@ -22,6 +22,10 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 
 BOT_MAGIC = 26072026
+SYMBOL_RISK_OVERRIDES = {
+    "EURUSD": 0.01,
+    "GBPUSD": 0.01,
+}
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -689,7 +693,7 @@ def main():
                         continue
 
                 strategy_plan = None
-                risk_per_trade = rules.max_risk_per_trade_pct
+                risk_per_trade = SYMBOL_RISK_OVERRIDES.get(symbol, rules.max_risk_per_trade_pct)
                 analyze_trade = getattr(strategy, "analyze_trade", None)
                 if callable(analyze_trade):
                     try:
@@ -741,7 +745,13 @@ def main():
                             size_multiplier=revenge_context["multiplier"],
                         )
                     else:
-                        size = risk.calculate_position_size(equity, price, stop, atr=atr) * revenge_context["multiplier"]
+                        size = risk.calculate_position_size(
+                            equity,
+                            price,
+                            stop,
+                            atr=atr,
+                            risk_per_trade=risk_per_trade,
+                        ) * revenge_context["multiplier"]
                         size_reason = "dry_run"
 
                 if size <= 0:
