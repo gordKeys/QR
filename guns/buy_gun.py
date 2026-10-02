@@ -12,7 +12,7 @@ import pandas as pd
 import MetaTrader5 as mt5
 
 # ============================ LOGIN ==========================================
-MT5_LOGIN = 1302211830                 # your XM account number
+MT5_LOGIN = 362294406                 # your XM account number
 MT5_PASSWORD = "Gordonpap@2023"          # your XM password (blank = attach to open, logged-in terminal)
 MT5_SERVER = "XMGlobal-MT5 6"
 TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
@@ -23,7 +23,7 @@ SYMBOL_CANDIDATES = ["XAUUSD", "GOLD"]     # tried in order, EXACT names only (X
 
 DIRECTION = mt5.ORDER_TYPE_BUY
 MAGIC = 130013
-MAX_TRADES = 500
+MAX_TRADES = 100
 LOT = 0.01
 MARGIN_USE_TARGET = 0.70    # fraction of equity usable as margin for the whole batch
 BATCH_RISK_CAP = 1.00       # batch worst-case loss at SL as fraction of equity
