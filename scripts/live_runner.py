@@ -23,8 +23,8 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.01,
-    "GBPUSD": 0.01,
+    "EURUSD": 0.005,
+    "GBPUSD": 0.005,
 }
 
 
