@@ -25,8 +25,8 @@ class FTMOComplianceConfig:
     max_total_loss_pct: float = 10.0
     state_path: Path = Path("logs/ftmo_compliance_state.json")
     market_close_buffer_minutes: int = 5
-    ghana_no_entry_start_hour: int = 19
-    ghana_no_entry_end_hour: int = 1
+    ghana_no_entry_start_hour: int = 21
+    ghana_no_entry_end_hour: int = 23
     news_calendar_url: str = DEFAULT_CALENDAR_URL
     news_pre_minutes: int = 5
     news_post_minutes: int = 10
@@ -122,8 +122,12 @@ class FTMOComplianceEngine:
 
     def ghana_no_entry_window(self, now_utc=None):
         now = (now_utc or datetime.now(timezone.utc)).astimezone(GHANA_TZ)
-        evening_window = now.weekday() in (0, 1, 2, 3, 4) and now.hour >= self.config.ghana_no_entry_start_hour
-        overnight_window = now.weekday() in (1, 2, 3, 4, 5) and now.hour < self.config.ghana_no_entry_end_hour
+        start_hour = self.config.ghana_no_entry_start_hour
+        end_hour = self.config.ghana_no_entry_end_hour
+        if start_hour < end_hour:
+            return now.weekday() in (0, 1, 2, 3, 4) and start_hour <= now.hour < end_hour
+        evening_window = now.weekday() in (0, 1, 2, 3, 4) and now.hour >= start_hour
+        overnight_window = now.weekday() in (1, 2, 3, 4, 5) and now.hour < end_hour
         return evening_window or overnight_window
 
     def _news_events(self):

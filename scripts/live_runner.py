@@ -23,8 +23,12 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.01,
-    "GBPUSD": 0.01,
+    "EURUSD": 0.015,
+    "GBPUSD": 0.015,
+}
+SYMBOL_TP_ATR_OVERRIDES = {
+    "EURUSD": 4.0,
+    "GBPUSD": 4.5,
 }
 
 
@@ -255,7 +259,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
-    parser.add_argument("--max-consecutive-losses", type=int, default=3)
+    parser.add_argument("--max-consecutive-losses", type=int, default=2)
     parser.add_argument("--cooldown-hours", type=int, default=3)
     parser.add_argument("--revenge-mode", action="store_true")
     parser.add_argument("--revenge-multiplier", type=float, default=2.0)
@@ -590,6 +594,10 @@ def main():
                                         },
                                     )
 
+                        print(f"{symbol}: skipped new entry because a bot-owned position is already open")
+                        cycle_counts["skip_existing_symbol_position"] += 1
+                        continue
+
                 if hard_drawdown.triggered:
                     print(f"{symbol}: skipped because hard drawdown switch is active")
                     append_jsonl(
@@ -716,7 +724,12 @@ def main():
                     size = float(strategy_plan.get("size")) * revenge_context["multiplier"]
                     size_reason = strategy_plan.get("size_reason", "strategy_plan")
                 else:
-                    stop, target = risk.calculate_sl_tp(signal, price, atr)
+                    stop, target = risk.calculate_sl_tp(
+                        signal,
+                        price,
+                        atr,
+                        tp_atr=SYMBOL_TP_ATR_OVERRIDES.get(symbol, 5.0),
+                    )
 
                     if broker and not args.dry_run:
                         stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)

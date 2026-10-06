@@ -28,7 +28,7 @@ def print_status(mode, args):
     if mode == "live":
         print(f"Dry run: {args.dry_run}")
         print(f"Loop once: {args.loop_once}")
-        print(f"Max consecutive losses: {args.max_consecutive_losses or 3}")
+        print(f"Max consecutive losses: {args.max_consecutive_losses or 2}")
     print("======================\n")
 
 
