@@ -99,6 +99,10 @@ def append_jsonl(path, payload):
         handle.write(json.dumps(payload, default=str) + "\n")
 
 
+def append_trade_dataset(path, payload):
+    append_jsonl(path, {"dataset_version": 1, **payload})
+
+
 def date_log_paths(log_dir, day):
     return (
         log_dir / f"live_run_{day.isoformat()}.jsonl",
@@ -359,6 +363,7 @@ def main():
     symbol_breaker = SymbolCircuitBreaker(max_stop_losses=2)
     trade_states = {}
     log_dir = ensure_log_dir()
+    trade_dataset = log_dir / "trade_dataset.jsonl"
     cooldown_until = None
     last_deal_check = None
     last_closed_pnl = None
@@ -514,6 +519,31 @@ def main():
                             "mfe_usd": trade_state.get("mfe_usd"),
                             "break_even_moved": trade_state.get("break_even_moved", False),
                             "break_even_sl": trade_state.get("break_even_sl"),
+                        },
+                    )
+                    append_trade_dataset(
+                        trade_dataset,
+                        {
+                            "record_type": "trade_outcome",
+                            "entry": trade_state.get("entry"),
+                            "exit": {
+                                "time": closed_time,
+                                "price": getattr(deal, "price", None),
+                                "volume": getattr(deal, "volume", None),
+                                "profit": profit,
+                                "commission": getattr(deal, "commission", None),
+                                "swap": getattr(deal, "swap", None),
+                                "fee": getattr(deal, "fee", None),
+                                "reason": getattr(deal, "reason", None),
+                                "entry_type": getattr(deal, "entry", None),
+                                "ticket": getattr(deal, "ticket", None),
+                            },
+                            "symbol": symbol,
+                            "stop_loss_hit": stop_loss_hit,
+                            "consecutive_losses": guard.consecutive_losses,
+                            "mfe_usd": trade_state.get("mfe_usd"),
+                            "break_even_moved": trade_state.get("break_even_moved", False),
+                            "initial_risk_usd": trade_state.get("initial_risk_usd"),
                         },
                     )
 
@@ -918,6 +948,14 @@ def main():
                         "revenge_mode": revenge_context["enabled"],
                         "revenge_stage": revenge_context["stage"],
                         "revenge_boosted": revenge_context["boosted"],
+                        "atr": atr,
+                        "spread_points": spread_points,
+                        "bar_time": broker_time,
+                        "bar_open": float(data["open"].iloc[-1]),
+                        "bar_high": float(data["high"].iloc[-1]),
+                        "bar_low": float(data["low"].iloc[-1]),
+                        "bar_close": float(data["close"].iloc[-1]),
+                        "atr_median_50": float(data["atr"].tail(50).median()),
                         "broker_time": broker_time,
                     },
                 )
@@ -963,6 +1001,33 @@ def main():
                                 "mfe_usd": float(getattr(current_position, "profit", 0.0) or 0.0),
                                 "break_even_moved": False,
                                 "break_even_sl": None,
+                                "opened_at": position_open_time(current_position),
+                                "initial_stop": stop,
+                                "initial_risk_usd": estimate_position_risk_usd(current_position, broker, stop),
+                                "entry": {
+                                    "time": broker_time,
+                                    "ticket": getattr(current_position, "ticket", None),
+                                    "symbol": symbol,
+                                    "broker_symbol": broker_symbol,
+                                    "strategy": strategy.__class__.__name__,
+                                    "signal": signal,
+                                    "score": signal_score,
+                                    "score_components": score_components,
+                                    "risk_per_trade": risk_per_trade,
+                                    "price": price,
+                                    "stop": stop,
+                                    "target": target,
+                                    "size": size,
+                                    "equity": equity,
+                                    "atr": atr,
+                                    "spread_points": spread_points,
+                                    "bar_time": broker_time,
+                                    "bar_open": float(data["open"].iloc[-1]),
+                                    "bar_high": float(data["high"].iloc[-1]),
+                                    "bar_low": float(data["low"].iloc[-1]),
+                                    "bar_close": float(data["close"].iloc[-1]),
+                                    "atr_median_50": float(data["atr"].tail(50).median()),
+                                },
                             }
                         revenge_update = revenge.on_trade_filled(symbol)
                         if revenge_update is not None:
