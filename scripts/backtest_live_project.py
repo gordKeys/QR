@@ -114,12 +114,26 @@ def download_history(symbols, output_dir, days):
             if selected is None or not mt5.symbol_select(selected.name, True):
                 raise RuntimeError(f"Could not resolve/select broker symbol for {canonical}")
             broker_symbols[canonical] = selected.name
-            rates = mt5.copy_rates_from_pos(selected.name, mt5.TIMEFRAME_M5, 1, bars)
+            chunks = []
+            chunk_size = 5000
+            start_pos = 1
+            while sum(len(chunk) for chunk in chunks) < bars:
+                chunk = mt5.copy_rates_from_pos(
+                    selected.name, mt5.TIMEFRAME_M5, start_pos, chunk_size
+                )
+                if chunk is None or len(chunk) == 0:
+                    break
+                chunks.append(chunk)
+                start_pos += len(chunk)
+                if len(chunk) < chunk_size:
+                    break
+            rates = np.concatenate(chunks) if chunks else None
             if rates is None or len(rates) < 500:
                 raise RuntimeError(f"Insufficient M5 history for {selected.name}: {mt5.last_error()}")
             frame = pd.DataFrame(rates)
             frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
             frame = frame.set_index("time").sort_index()
+            frame = frame.tail(bars)
             frame["spread"] = frame.get("spread", 0.0).fillna(0.0)
             frame["real_volume"] = frame.get("real_volume", 0.0).fillna(0.0)
             frames[canonical] = FeatureEngine().add_features(frame)
