@@ -20,7 +20,7 @@
   2. Session start buffer — no trades in first 2hrs (7-9am UTC)
   3. Stricter entry after losses — requires 5/5 confirmations
      on first trade after a losing streak (instead of 4/5)
-  4. Martingale pause — after 2 consecutive losses, wait 1 candle
+  4. Loss pause — after 2 consecutive losses, wait 1 candle
      (15 mins) before re-entering to avoid chasing bad markets
   5. Gold-first priority — when Gold has a valid signal, skip
      EUR/GBP that loop to avoid correlated exposure
@@ -82,14 +82,12 @@ SYMBOL_CONFIG = {
 }
 
 # Sizing
-MARTINGALE_FACTOR = 2.0
-MAX_MARTINGALE    = 4.0
 WIN_STREAK_BOOST  = 1.5
 MAX_WIN_BOOST     = 4.0
 
-# v2: Martingale pause after N consecutive losses
-MARTINGALE_PAUSE_LOSSES  = 2       # Pause after this many losses in a row
-MARTINGALE_PAUSE_MINUTES = 15      # Wait this many minutes before next entry
+# v2: Loss pause after N consecutive losses
+LOSS_PAUSE_LOSSES  = 2
+LOSS_PAUSE_MINUTES = 15
 
 # Filters
 USE_SESSION_FILTER  = True
@@ -141,7 +139,6 @@ state = {
     sym: {
         "consec_wins"   : 0,
         "consec_losses" : 0,
-        "martingale"    : 1.0,
         "last_signal"   : None,
         "last_sl_time"  : None,   # datetime of last SL hit
         "total_trades"  : 0,
@@ -271,7 +268,7 @@ def bearish_pin_bar(row):
 
 
 # ─────────────────────────────────────────────
-#  v2: MARTINGALE PAUSE CHECK
+#  v2: LOSS PAUSE CHECK
 # ─────────────────────────────────────────────
 
 def is_paused(sym_state, symbol):
@@ -279,7 +276,7 @@ def is_paused(sym_state, symbol):
     Returns True if this symbol should be skipped due to
     consecutive losses + pause timer.
     """
-    if sym_state["consec_losses"] < MARTINGALE_PAUSE_LOSSES:
+    if sym_state["consec_losses"] < LOSS_PAUSE_LOSSES:
         return False
 
     last_sl = sym_state.get("last_sl_time")
@@ -291,8 +288,8 @@ def is_paused(sym_state, symbol):
     # last_sl_time stored as naive local — convert for comparison
     elapsed   = (now_utc - last_sl.replace(tzinfo=UTC)).total_seconds() / 60
 
-    if elapsed < MARTINGALE_PAUSE_MINUTES:
-        remaining = int(MARTINGALE_PAUSE_MINUTES - elapsed)
+    if elapsed < LOSS_PAUSE_MINUTES:
+        remaining = int(LOSS_PAUSE_MINUTES - elapsed)
         log.info(
             f"[{symbol}]  PAUSED after {sym_state['consec_losses']} losses  |  "
             f"Resuming in {remaining} min"
@@ -400,9 +397,7 @@ def get_volume(symbol, balance, atr, sym_state):
 
     wins     = sym_state["consec_wins"]
     win_mult = min(WIN_STREAK_BOOST ** max(0, wins - 1), MAX_WIN_BOOST)
-    mart_mult = sym_state["martingale"]
-
-    eff_risk    = cfg["base_risk"] * win_mult * mart_mult
+    eff_risk    = cfg["base_risk"] * win_mult
     eff_risk    = min(eff_risk, cfg["max_risk"])
 
     risk_amount = balance * (eff_risk / 100)
@@ -416,7 +411,6 @@ def get_volume(symbol, balance, atr, sym_state):
         f"[{symbol}]  VX Sizing  |  "
         f"Base: {cfg['base_risk']}%  "
         f"WinMult: {win_mult:.2f}x  "
-        f"Martingale: {mart_mult:.2f}x  "
         f"EffRisk: {eff_risk:.1f}%  "
         f"Vol: {volume}  "
         f"Risk$: ${risk_amount:.2f}"
@@ -513,7 +507,6 @@ def update_state_from_history(symbol, sym_state):
         sym_state["total_wins"]    += 1
         sym_state["consec_wins"]   += 1
         sym_state["consec_losses"]  = 0
-        sym_state["martingale"]     = 1.0
         sym_state["last_signal"]    = None
         log.info(
             f"[{symbol}]  CLOSED WIN  +${profit:.2f}  |  "
@@ -524,14 +517,9 @@ def update_state_from_history(symbol, sym_state):
         sym_state["consec_losses"] += 1
         sym_state["consec_wins"]    = 0
         sym_state["last_sl_time"]   = datetime.now()
-        sym_state["martingale"]     = min(
-            sym_state["martingale"] * MARTINGALE_FACTOR,
-            MAX_MARTINGALE
-        )
         log.info(
             f"[{symbol}]  CLOSED LOSS  ${profit:.2f}  |  "
             f"Loss streak: {sym_state['consec_losses']}  |  "
-            f"Martingale: {sym_state['martingale']:.2f}x  |  "
             f"Total P&L: ${sym_state['total_pnl']:.2f}"
         )
 
@@ -564,7 +552,7 @@ def print_summary(start_balance):
             f"WR: {wr:.0f}%  "
             f"P&L: ${s['total_pnl']:.2f}  "
             f"Streak: {s['consec_wins']}W/{s['consec_losses']}L  "
-            f"Mart: {s['martingale']:.1f}x"
+            f"Losses: {s['consec_losses']}"
         )
     log.info("=" * 55)
 
@@ -585,7 +573,7 @@ def run_vx():
     log.info(f"  Balance     : ${account.balance:.2f}")
     log.info(f"  Session     : {SESSION_START_UTC}am-{SESSION_END_UTC}pm UTC (v2: no early trades)")
     log.info(f"  Recover mode: 5/5 confirmations after any loss")
-    log.info(f"  Mart pause  : {MARTINGALE_PAUSE_MINUTES}min after {MARTINGALE_PAUSE_LOSSES} consecutive losses")
+    log.info(f"  Loss pause  : {LOSS_PAUSE_MINUTES}min after {LOSS_PAUSE_LOSSES} consecutive losses")
     log.info(f"  Gold first  : {'ON' if USE_GOLD_PRIORITY else 'OFF'}")
     log.info(f"  Mode        : UNRESTRICTED")
     log.info("=" * 65)

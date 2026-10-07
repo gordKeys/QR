@@ -27,8 +27,6 @@ DEFAULT_SYMBOLS = tuple(SYMBOL_DEFAULTS)
 RR_RATIO = 2.0
 SESSION_HOURS = set(range(9, 22))
 H1_EMA = 50
-MARTINGALE_FACTOR = 2.0
-MAX_MARTINGALE = 4.0
 WIN_STREAK_BOOST = 1.5
 MAX_WIN_BOOST = 4.0
 PAUSE_LOSSES = 2
@@ -182,7 +180,7 @@ def close_position(position: Position, bar: pd.Series, spread: float, commission
 def run_backtest(frames: dict[str, pd.DataFrame], initial_balance: float, spread_points: dict[str, float], commission: dict[str, float], point: dict[str, float], start=None, end=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     frames = {symbol: data.loc[start:end] for symbol, data in frames.items()}
     timeline = sorted(set().union(*(data.index for data in frames.values())))
-    states = {symbol: {"losses": 0, "wins": 0, "mart": 1.0, "win_streak": 0, "last_loss": None} for symbol in frames}
+    states = {symbol: {"losses": 0, "wins": 0, "win_streak": 0, "last_loss": None} for symbol in frames}
     positions: dict[str, Position] = {}
     pending: list[tuple[str, str, int, float]] = []
     balance = initial_balance
@@ -202,7 +200,7 @@ def run_backtest(frames: dict[str, pd.DataFrame], initial_balance: float, spread
             target = entry + distance * RR_RATIO if direction == "BUY" else entry - distance * RR_RATIO
             state = states[symbol]
             win_mult = min(WIN_STREAK_BOOST ** max(0, state["win_streak"] - 1), MAX_WIN_BOOST)
-            effective_risk = min(cfg["risk"] * win_mult * state["mart"], cfg["risk"] * 5)
+            effective_risk = min(cfg["risk"] * win_mult, cfg["risk"] * 5)
             risk_usd = balance * effective_risk / 100
             value_per_price = cfg["value"]
             volume = risk_usd / max(distance * value_per_price, 1e-12)
@@ -221,11 +219,9 @@ def run_backtest(frames: dict[str, pd.DataFrame], initial_balance: float, spread
                 state["wins"] += 1
                 state["win_streak"] += 1
                 state["losses"] = 0
-                state["mart"] = 1.0
             else:
                 state["losses"] += 1
                 state["win_streak"] = 0
-                state["mart"] = min(state["mart"] * MARTINGALE_FACTOR, MAX_MARTINGALE)
                 state["last_loss"] = timestamp
             trades.append({**asdict(position), **outcome, "balance_after": balance, "effective_risk_usd": position.risk_usd})
             del positions[symbol]
