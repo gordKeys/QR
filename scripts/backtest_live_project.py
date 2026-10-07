@@ -279,6 +279,8 @@ def run_simulation(frames, specs, initial_balance, start=None, end=None):
             daily_base = balance
 
         for symbol, position in list(positions.items()):
+            if timestamp not in frames[symbol].index:
+                continue
             bar = frames[symbol].loc[timestamp]
             floating = pnl_for_move(position, float(bar.close), specs) + COMMISSION_PER_LOT * position.volume
             position.mfe_usd = max(position.mfe_usd, floating)
