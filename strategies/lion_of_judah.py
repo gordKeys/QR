@@ -218,7 +218,7 @@ class LionOfJudahFiveSignalStrategy(BaseStrategy):
         stop = round(stop, digits)
         target = round(target, digits)
 
-        risk_amount = equity * 0.004
+        risk_amount = equity * 0.005
         stop_distance_abs = abs(price - stop)
         if stop_distance_abs <= 0:
             return None
@@ -288,7 +288,7 @@ class LionOfJudahFiveSignalStrategy(BaseStrategy):
             stop = price + (atr_stop * self.rr if self.mirror else atr_stop)
             target = price - (atr_stop if self.mirror else atr_stop * self.rr)
 
-        risk_amount = equity * 0.004
+        risk_amount = equity * 0.005
         stop_distance_abs = abs(price - stop)
         if stop_distance_abs <= 0:
             return None

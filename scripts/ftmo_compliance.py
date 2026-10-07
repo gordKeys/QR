@@ -38,6 +38,15 @@ class FTMOComplianceConfig:
 class FTMOComplianceEngine:
     """Execution guard; it does not alter strategy signals or position sizing."""
 
+    SYMBOL_MARKET_GUARDS = {
+        "EURUSD": {"max_spread_points": 25.0, "max_candle_atr": 2.5, "max_atr_ratio": 2.5},
+        "GBPUSD": {"max_spread_points": 25.0, "max_candle_atr": 2.5, "max_atr_ratio": 2.5},
+        "USDJPY": {"max_spread_points": 25.0, "max_candle_atr": 2.5, "max_atr_ratio": 2.5},
+        "AUDUSD": {"max_spread_points": 25.0, "max_candle_atr": 2.5, "max_atr_ratio": 2.5},
+        "USDCHF": {"max_spread_points": 25.0, "max_candle_atr": 2.5, "max_atr_ratio": 2.5},
+        "XAUUSD": {"max_spread_points": 100.0, "max_candle_atr": 2.5, "max_atr_ratio": 3.0},
+    }
+
     def __init__(self, config: FTMOComplianceConfig):
         self.config = config
         self.state_path = Path(config.state_path)
@@ -180,12 +189,29 @@ class FTMOComplianceEngine:
         return None
 
     def execution_market_guard(self, symbol, *, spread_points=None, candle_range=None, atr=None, typical_atr=None):
-        if spread_points is not None and spread_points > self.config.max_spread_points:
-            return {'reason': 'spread_too_wide', 'spread_points': spread_points}
-        if atr and candle_range is not None and candle_range > atr * self.config.max_candle_atr:
+        symbol_key = next(
+            (key for key in self.SYMBOL_MARKET_GUARDS if symbol.upper().startswith(key)),
+            None,
+        )
+        profile = self.SYMBOL_MARKET_GUARDS.get(symbol_key, {})
+        max_spread_points = profile.get("max_spread_points", self.config.max_spread_points)
+        max_candle_atr = profile.get("max_candle_atr", self.config.max_candle_atr)
+        max_atr_ratio = profile.get("max_atr_ratio", self.config.max_atr_ratio)
+        if spread_points is not None and spread_points > max_spread_points:
+            return {
+                'reason': 'spread_too_wide',
+                'spread_points': spread_points,
+                'max_spread_points': max_spread_points,
+            }
+        if atr and candle_range is not None and candle_range > atr * max_candle_atr:
             return {'reason': 'abnormal_candle_range', 'candle_range': candle_range, 'atr': atr}
-        if atr and typical_atr and atr > typical_atr * self.config.max_atr_ratio:
-            return {'reason': 'volatility_spike', 'atr': atr, 'typical_atr': typical_atr}
+        if atr and typical_atr and atr > typical_atr * max_atr_ratio:
+            return {
+                'reason': 'volatility_spike',
+                'atr': atr,
+                'typical_atr': typical_atr,
+                'max_atr_ratio': max_atr_ratio,
+            }
         return None
 
     def should_block_new_entry(self, symbol, now_utc=None):

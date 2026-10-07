@@ -22,9 +22,15 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 
 BOT_MAGIC = 26072026
+LOSS_MANAGEMENT_MAX_M5_CANDLES = 12
+LOSS_MANAGEMENT_MIN_PROGRESS_R = 0.25
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.015,
-    "GBPUSD": 0.015,
+    "EURUSD": 0.01,
+    "GBPUSD": 0.01,
+    "AUDUSD": 0.005,
+    "USDJPY": 0.005,
+    "USDCHF": 0.005,
+    "XAUUSD": 0.005,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
     "EURUSD": 4.0,
@@ -231,8 +237,15 @@ def ensure_trade_state(trade_states, position, state_key=None):
             "mfe_usd": float(getattr(position, "profit", 0.0) or 0.0),
             "break_even_moved": False,
             "break_even_sl": None,
+            "opened_at": position_open_time(position),
+            "initial_stop": float(getattr(position, "sl", 0.0) or 0.0) or None,
+            "initial_risk_usd": None,
         }
         trade_states[key] = state
+    else:
+        state.setdefault("opened_at", position_open_time(position))
+        state.setdefault("initial_stop", float(getattr(position, "sl", 0.0) or 0.0) or None)
+        state.setdefault("initial_risk_usd", None)
     return state
 
 
@@ -246,6 +259,53 @@ def update_trade_mfe(trade_states, position, new_profit, state_key=None):
     return False, state
 
 
+def position_open_time(position):
+    timestamp = getattr(position, "time", None)
+    if timestamp is None:
+        timestamp = getattr(position, "time_msc", None)
+        if timestamp is not None:
+            timestamp = timestamp / 1000.0
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def estimate_position_risk_usd(position, broker, initial_stop):
+    if initial_stop is None:
+        return None
+    info = broker.symbol_info(position.symbol)
+    if info is None:
+        return None
+    stop_distance = abs(float(getattr(position, "price_open", 0.0) or 0.0) - float(initial_stop))
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    if stop_distance <= 0 or tick_value <= 0 or tick_size <= 0:
+        return None
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    return stop_distance / tick_size * tick_value * volume
+
+
+def completed_m5_candles(position, last_completed_bar):
+    opened_at = position_open_time(position)
+    if opened_at is None or last_completed_bar is None:
+        return None
+    try:
+        elapsed = last_completed_bar.to_pydatetime().replace(tzinfo=timezone.utc) - opened_at
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return max(0, int(elapsed.total_seconds() // 300))
+
+
+def setup_invalidation_reason(position, broker, signal):
+    side = position_side(position, broker)
+    if side and signal == -side:
+        return "opposite_confirmed_signal"
+    return None
+
+
 def format_countdown(seconds):
     if seconds is None:
         return "n/a"
@@ -255,7 +315,11 @@ def format_countdown(seconds):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "XAUUSD"],
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
@@ -535,6 +599,7 @@ def main():
                     positions = filter_owned_positions(broker.positions_get(symbol=broker_symbol))
                     if positions:
                         current_position = positions[0]
+                        position_signal, _, _, _ = latest_signal(symbol, data, router)
                         compliance_action = compliance.should_flatten_position(symbol, started) if compliance else None
                         if compliance_action:
                             reason = compliance_action["reason"]
@@ -546,6 +611,12 @@ def main():
                                 cycle_counts["ftmo_forced_closes"] += 1
                                 continue
                         state = ensure_trade_state(trade_states, current_position, state_key=symbol)
+                        if state.get("initial_risk_usd") is None:
+                            state["initial_risk_usd"] = estimate_position_risk_usd(
+                                current_position,
+                                broker,
+                                state.get("initial_stop"),
+                            )
                         current_profit = float(getattr(current_position, "profit", 0.0) or 0.0)
                         updated, state = update_trade_mfe(trade_states, current_position, current_profit, state_key=symbol)
                         if updated:
@@ -560,6 +631,56 @@ def main():
                                     "time": started,
                                 },
                             )
+
+                        early_exit_reason = setup_invalidation_reason(current_position, broker, position_signal)
+                        candles_held = completed_m5_candles(
+                            current_position,
+                            data.index[-2] if len(data.index) >= 2 else data.index[-1],
+                        )
+                        progress_threshold = None
+                        initial_risk_usd = state.get("initial_risk_usd")
+                        if initial_risk_usd is not None:
+                            progress_threshold = initial_risk_usd * LOSS_MANAGEMENT_MIN_PROGRESS_R
+                        if (
+                            early_exit_reason is None
+                            and candles_held is not None
+                            and candles_held >= LOSS_MANAGEMENT_MAX_M5_CANDLES
+                            and (
+                                current_profit <= 0
+                                or progress_threshold is None
+                                or float(state.get("mfe_usd", 0.0) or 0.0) < progress_threshold
+                            )
+                        ):
+                            early_exit_reason = "12_m5_candles_without_meaningful_progress"
+
+                        if early_exit_reason:
+                            result = broker.close_position(current_position, comment=f"Loss management {early_exit_reason}")
+                            accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
+                            print(
+                                f"{symbol}: loss-management close reason={early_exit_reason} "
+                                f"candles_held={candles_held} profit={current_profit:.2f} result={result}"
+                            )
+                            append_jsonl(
+                                run_log,
+                                {
+                                    "event": "loss_management_close",
+                                    "symbol": symbol,
+                                    "ticket": getattr(current_position, "ticket", None),
+                                    "reason": early_exit_reason,
+                                    "signal": position_signal,
+                                    "candles_held": candles_held,
+                                    "current_profit": current_profit,
+                                    "mfe_usd": state.get("mfe_usd"),
+                                    "initial_risk_usd": initial_risk_usd,
+                                    "progress_threshold_usd": progress_threshold,
+                                    "accepted": accepted,
+                                    "result": str(result),
+                                    "broker_time": started,
+                                },
+                            )
+                            if accepted:
+                                cycle_counts["loss_management_closes"] += 1
+                                continue
 
                         break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
                         if not state.get("break_even_moved") and current_profit >= break_even_trigger:

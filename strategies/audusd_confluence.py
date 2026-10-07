@@ -16,7 +16,7 @@ class AUDUSDConfluenceStrategy(BaseStrategy):
         overbought=68,
         oversold=32,
         trend_ema=20,
-        risk_pct=0.35,
+        risk_pct=0.5,
         stop_buffer_mult=2.0,
         min_atr_points=5,
         forex_hours=range(6, 21),
