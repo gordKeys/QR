@@ -22,7 +22,7 @@ class FTMOComplianceConfig:
     account_type: str = ACCOUNT_TYPE_STANDARD
     initial_balance: float = 0.0
     max_daily_loss_pct: float = 5.0
-    max_total_loss_pct: float = 10.0
+    max_total_loss_pct: float = 3.0
     state_path: Path = Path("logs/ftmo_compliance_state.json")
     market_close_buffer_minutes: int = 5
     ghana_no_entry_start_hour: int = 21

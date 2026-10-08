@@ -407,6 +407,7 @@ def main():
                     FTMOComplianceConfig(
                         account_type=args.account_type,
                         initial_balance=args.ftmo_initial_capital or live_balance or live_equity,
+                        max_total_loss_pct=3.0,
                         market_close_buffer_minutes=args.market_close_buffer_minutes,
                         news_calendar_url=args.news_calendar_url or FTMOComplianceConfig().news_calendar_url,
                         news_pre_minutes=args.news_pre_minutes,
