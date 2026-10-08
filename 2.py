@@ -12,7 +12,7 @@
 
   VX TRADING BOT — LIVE DEPLOYMENT v2
   Broker    : Exness (MT5)
-  Symbols   : EURUSD, GBPUSD, XAUUSD
+  Symbols   : EURUSDm, GBPUSDm, XAUUSDm
   Timeframe : M15 + H1 trend filter
 
   v2 IMPROVEMENTS OVER v1:
@@ -53,26 +53,26 @@ TERMINAL_PATH   = os.getenv("VX_MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrade
 #  VX v2 SETTINGS
 # ─────────────────────────────────────────────
 
-SYMBOLS   = ["EURUSD", "GBPUSD", "XAUUSD"]
+SYMBOLS   = ["EURUSDm", "GBPUSDm", "XAUUSDm"]
 TIMEFRAME = mt5.TIMEFRAME_M15
 RR_RATIO  = 2.0
 
 SYMBOL_CONFIG = {
-    "EURUSD": {
+    "EURUSDm": {
         "min_confirmations"        : 4,   # Normal entry threshold
         "min_confirmations_recover": 5,   # After a loss — stricter
         "atr_multiplier"           : 1.2,
         "base_risk"                : 2.0,
         "max_risk"                 : 10.0,
     },
-    "GBPUSD": {
+    "GBPUSDm": {
         "min_confirmations"        : 4,
         "min_confirmations_recover": 5,
         "atr_multiplier"           : 1.3,
         "base_risk"                : 2.0,
         "max_risk"                 : 10.0,
     },
-    "XAUUSD": {
+    "XAUUSDm": {
         "min_confirmations"        : 4,
         "min_confirmations_recover": 5,
         "atr_multiplier"           : 1.5,
@@ -604,14 +604,14 @@ def run_vx():
 
             # Pre-scan Gold for signal (won't place — just peek)
             if USE_GOLD_PRIORITY:
-                gold_state = state["XAUUSD"]
-                gold_pos   = get_open_position("XAUUSD")
-                if not gold_pos and not is_paused(gold_state, "XAUUSD"):
-                    gdf = get_candles("XAUUSD", TIMEFRAME, CANDLE_COUNT)
+                gold_state = state["XAUUSDm"]
+                gold_pos   = get_open_position("XAUUSDm")
+                if not gold_pos and not is_paused(gold_state, "XAUUSDm"):
+                    gdf = get_candles("XAUUSDm", TIMEFRAME, CANDLE_COUNT)
                     if gdf is not None:
                         gdf      = add_indicators(gdf)
-                        g_trend  = get_h1_trend("XAUUSD") if USE_TREND_FILTER else None
-                        g_signal, g_atr, g_score = get_signal("XAUUSD", gdf, g_trend, gold_state)
+                        g_trend  = get_h1_trend("XAUUSDm") if USE_TREND_FILTER else None
+                        g_signal, g_atr, g_score = get_signal("XAUUSDm", gdf, g_trend, gold_state)
                         if g_signal:
                             gold_trading_this_loop = True
                             log.info("  [GOLD PRIORITY] Gold has a signal — skipping EUR/GBP this loop")
@@ -622,7 +622,7 @@ def run_vx():
                 log.info(f"\n-- {symbol} --")
 
                 # v2: Gold priority — skip minor pairs if Gold trading
-                if USE_GOLD_PRIORITY and gold_trading_this_loop and symbol != "XAUUSD":
+                if USE_GOLD_PRIORITY and gold_trading_this_loop and symbol != "XAUUSDm":
                     log.info(f"[{symbol}]  Skipped — Gold priority active this loop")
                     continue
 
