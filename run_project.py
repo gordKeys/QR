@@ -135,7 +135,7 @@ def main():
         if args.mt5_path:
             live_args.extend(["--mt5-path", args.mt5_path])
         if not live_args:
-            live_args = ["--symbols", "EURUSD", "GBPUSD", "USDJPY"]
+            live_args = ["--symbols", "EURUSD", "GBPUSD", "XAUUSD"]
         return run_script("live_runner.py", live_args)
 
     return 1

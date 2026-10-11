@@ -11,6 +11,7 @@ from datetime import timedelta
 
 from engine.data_loader import DataLoader
 from engine.features import FeatureEngine
+from engine.regime_classifier import classify as classify_regime
 from engine.risk_manager import RiskManager
 from ftmo_rules import FtmoRules, FtmoRiskGuard
 from strategy_router import StrategyRouter
@@ -25,11 +26,117 @@ BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
     "EURUSD": 0.015,
     "GBPUSD": 0.015,
+    "XAUUSD": 0.015,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
-    "EURUSD": 4.0,
-    "GBPUSD": 4.5,
+    "EURUSD": 3.5,
+    "GBPUSD": 4.0,
 }
+EUR_GBP_RISK_CAP_PCT = 0.03
+DAILY_SOFT_STOP_PCT = 0.035
+HARD_LOSS_STOP_PCT = 0.04
+BLOCK_NEW_YORK_ENTRIES = True
+POSITION_GROUPS = {
+    "EUR_GBP": {"EURUSD", "GBPUSD"},
+}
+
+
+def position_group(symbol):
+    canonical = symbol.upper()
+    return "EUR_GBP" if canonical in POSITION_GROUPS["EUR_GBP"] else "OTHER"
+
+
+def session_name(timestamp):
+    from zoneinfo import ZoneInfo
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    hour = timestamp.astimezone(ZoneInfo("Europe/London")).hour
+    if hour < 8:
+        return "Asia"
+    if hour < 13:
+        return "London"
+    if hour < 21:
+        return "NewYork"
+    return "Late"
+
+
+def risk_from_position(position, broker):
+    stop = float(getattr(position, "sl", 0.0) or 0.0)
+    entry = float(getattr(position, "price_open", 0.0) or 0.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    if stop <= 0 or entry <= 0 or volume <= 0:
+        return 0.0
+    info = broker.symbol_info(getattr(position, "symbol", ""))
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0) if info else 0.0
+    if tick_value <= 0 or tick_size <= 0:
+        return 0.0
+    return abs(entry - stop) / tick_size * tick_value * volume
+
+
+def risk_from_order(symbol, entry, stop, volume, broker):
+    info = broker.symbol_info(symbol)
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0) if info else 0.0
+    if tick_value <= 0 or tick_size <= 0:
+        return 0.0
+    return abs(entry - stop) / tick_size * tick_value * volume
+
+
+def entry_context(data, regime, signal, spread_points):
+    timestamp = data.index[-1].to_pydatetime()
+    current = data.iloc[-1]
+    candle_range = float(current["high"] - current["low"])
+    body_ratio = abs(float(current["close"] - current["open"])) / candle_range if candle_range > 0 else 0.0
+    atr = float(current.get("atr", 0.0) or 0.0)
+    recent_high = float(data["high"].tail(96).max())
+    recent_low = float(data["low"].tail(96).min())
+    close = float(current["close"])
+    distance_to_session_high_atr = (recent_high - close) / atr if atr > 0 else None
+    distance_to_session_low_atr = (close - recent_low) / atr if atr > 0 else None
+    components = {
+        "m15_regime_score": regime["m15"].get("score"),
+        "m15_regime_label": regime["m15"].get("label"),
+        "m30_regime_score": regime["m30"].get("score"),
+        "m30_regime_label": regime["m30"].get("label"),
+        "m30_adx": regime["m30"].get("adx"),
+        "m30_ema_slope": regime["m30"].get("ema_slope"),
+        "candle_body_ratio": body_ratio,
+        "distance_to_session_high_atr": distance_to_session_high_atr,
+        "distance_to_session_low_atr": distance_to_session_low_atr,
+        "spread_points": spread_points,
+        "atr": atr,
+    }
+    m30_slope = regime["m30"].get("ema_slope")
+    m30_atr = regime["m30"].get("atr") or 0.0
+    opposing_m30 = bool(
+        signal and regime["m30"].get("label") == "trending" and m30_slope is not None
+        and abs(m30_slope) > m30_atr * 0.20 and (1 if m30_slope > 0 else -1) == -signal
+    )
+    components["m30_opposes_reversion"] = opposing_m30
+    return session_name(timestamp), components
+
+
+def entry_quality_block(symbol, data, regime, signal, score, score_components, spread_points):
+    if symbol in {"EURUSD", "GBPUSD"}:
+        session, context = entry_context(data, regime, signal, spread_points)
+        if session != "Asia":
+            return "asia_only_session", session, context
+        if regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging":
+            return "m15_regime_not_ranging", session, context
+        if regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
+            return "m30_opposes_reversion", session, context
+        if context["candle_body_ratio"] < 0.20 or context["candle_body_ratio"] > 0.90:
+            return "poor_candle_quality", session, context
+        current_z = score_components.get("current_z") if score_components else None
+        if current_z is not None and abs(float(current_z)) > 3.5:
+            return "no_chase_extreme", session, context
+        if score is not None and score < 4:
+            return "score_below_4", session, context
+        return None, session, context
+    session, context = entry_context(data, regime, signal, spread_points)
+    return None, session, context
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -255,7 +362,7 @@ def format_countdown(seconds):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY"])
+    parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "XAUUSD"])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--loop-once", action="store_true")
@@ -281,8 +388,11 @@ def main():
     parser.add_argument("--mt5-path", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe")
     args = parser.parse_args()
 
-    router = StrategyRouter()
-    rules = FtmoRules(initial_balance=10000, max_consecutive_losses=args.max_consecutive_losses)
+    router = StrategyRouter(
+        score_mode="current",
+        score_mode_by_symbol={"EURUSD": "relaxed", "XAUUSD": "relaxed", "GBPUSD": "current"},
+    )
+    rules = FtmoRules(initial_balance=10000, max_consecutive_losses=args.max_consecutive_losses, max_open_positions=2)
     guard = FtmoRiskGuard(rules)
     risk = RiskManager(risk_per_trade=rules.max_risk_per_trade_pct)
     revenge = RevengeTradeManager(
@@ -314,6 +424,12 @@ def main():
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
     print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
     print(f"FTMO account type: {args.account_type}")
+    print("Portfolio limit: 2 positions (max 1 EURUSD/GBPUSD group + 1 other)")
+    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.50%")
+    print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
+    print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
+    print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
+    print(f"New York entries: {'BLOCKED' if BLOCK_NEW_YORK_ENTRIES else 'ALLOWED'}")
 
     broker = None
     if not args.dry_run:
@@ -385,20 +501,21 @@ def main():
             guard.consecutive_losses = 0
             append_jsonl(run_log, {"event": "cooldown_lifted", "time": started})
 
+        compliance_report = None
         if broker and not args.dry_run:
             account_info = broker.mt5.account_info()
             current_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
             current_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
             if current_equity is not None and current_balance is not None:
                 if compliance is not None:
-                    report = compliance.refresh_account(balance=current_balance, equity=current_equity, now_utc=started)
+                    compliance_report = compliance.refresh_account(balance=current_balance, equity=current_equity, now_utc=started)
                     print(
-                        f"FTMO | Prague={report['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
-                        f"DayResetIn={format_countdown(report['seconds_to_reset'])} | "
-                        f"DailyBase=${report['daily_base']:.2f} | DailyMaxLoss=${report['daily_loss_amount']:.2f} | "
-                        f"DailyLimit=${report['daily_limit']:.2f} | DailyBuf=${report['daily_buffer']:+.2f} | "
-                        f"TotalBase=${report['total_base']:.2f} | TotalMaxLoss=${report['total_loss_amount']:.2f} | "
-                        f"TotalLimit=${report['total_limit']:.2f} | TotalBuf=${report['total_buffer']:+.2f}"
+                        f"FTMO | Prague={compliance_report['prague_now'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                        f"DayResetIn={format_countdown(compliance_report['seconds_to_reset'])} | "
+                        f"DailyBase=${compliance_report['daily_base']:.2f} | DailyMaxLoss=${compliance_report['daily_loss_amount']:.2f} | "
+                        f"DailyLimit=${compliance_report['daily_limit']:.2f} | DailyBuf=${compliance_report['daily_buffer']:+.2f} | "
+                        f"TotalBase=${compliance_report['total_base']:.2f} | TotalMaxLoss=${compliance_report['total_loss_amount']:.2f} | "
+                        f"TotalLimit=${compliance_report['total_limit']:.2f} | TotalBuf=${compliance_report['total_buffer']:+.2f}"
                     )
                 if hard_drawdown_day != current_day:
                     hard_drawdown.reset_day(current_equity)
@@ -421,6 +538,31 @@ def main():
                     f"PnL=${session_pnl:+.2f} ({pnl_pct:+.2f}%) | "
                     f"ref_balance=${reference_balance:.2f}"
                 )
+
+                if (
+                    compliance_report is not None
+                    and current_equity <= compliance_report["daily_base"] * (1.0 - HARD_LOSS_STOP_PCT)
+                    and broker is not None
+                ):
+                    owned_positions = filter_owned_positions(broker.positions_get())
+                    no_positive_mfe = all(
+                        float(state.get("mfe_usd", 0.0)) <= 0.0
+                        for state in trade_states.values()
+                    )
+                    if owned_positions and no_positive_mfe:
+                        print(f"Hard loss stop active: {HARD_LOSS_STOP_PCT * 100:.2f}% daily drawdown without positive MFE")
+                        for position in owned_positions:
+                            result = broker.close_position(position, comment="hard_loss_stop")
+                            append_jsonl(
+                                run_log,
+                                {
+                                    "event": "hard_loss_stop_close",
+                                    "symbol": getattr(position, "symbol", ""),
+                                    "ticket": getattr(position, "ticket", None),
+                                    "result": str(result),
+                                    "broker_time": started,
+                                },
+                            )
 
         live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
 
@@ -660,6 +802,8 @@ def main():
                 signal, strategy, signal_score, score_components = latest_signal(
                     symbol, data, router, spread_points=spread_points
                 )
+                regime = classify_regime(data)
+                session, market_context = entry_context(data, regime, signal, spread_points)
                 if broker and not args.dry_run:
                     price = float(tick.ask if signal == 1 else tick.bid)
                     equity = broker.account_equity() or rules.initial_balance
@@ -674,10 +818,15 @@ def main():
                     append_jsonl(
                         run_log,
                         {
-                            "event": "skip",
+                            "event": "candidate",
                             "symbol": symbol,
                             "reason": "no_signal",
                             "signal": signal,
+                            "score": signal_score,
+                            "score_components": score_components,
+                            "regime": regime,
+                            "session": session,
+                            "market_context": market_context,
                             "equity": equity,
                             "broker_time": broker_time,
                         },
@@ -699,6 +848,51 @@ def main():
                         append_jsonl(run_log, {"event": "ftmo_entry_blocked", "symbol": symbol, "reason": reason, "broker_time": broker_time})
                         cycle_counts["ftmo_entry_blocked"] += 1
                         continue
+                    if (
+                        compliance_report is not None
+                        and equity <= compliance_report["daily_base"] * (1.0 - DAILY_SOFT_STOP_PCT)
+                    ):
+                        print(f"{symbol}: blocked by daily soft stop ({DAILY_SOFT_STOP_PCT * 100:.2f}%)")
+                        append_jsonl(
+                            run_log,
+                            {
+                                "event": "candidate",
+                                "symbol": symbol,
+                                "reason": "daily_soft_stop",
+                                "equity": equity,
+                                "daily_base": compliance_report["daily_base"],
+                                "soft_stop_pct": DAILY_SOFT_STOP_PCT,
+                                "broker_time": broker_time,
+                            },
+                        )
+                        cycle_counts["skip_daily_soft_stop"] += 1
+                        continue
+
+                quality_reason, session, market_context = entry_quality_block(
+                    symbol, data, regime, signal, signal_score, score_components, spread_points
+                )
+                if BLOCK_NEW_YORK_ENTRIES and session == "NewYork":
+                    quality_reason = "new_york_blocked"
+                if quality_reason:
+                    print(f"{symbol}: blocked by entry quality ({quality_reason})")
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "candidate",
+                            "symbol": symbol,
+                            "reason": quality_reason,
+                            "signal": signal,
+                            "score": signal_score,
+                            "score_components": score_components,
+                            "regime": regime,
+                            "session": session,
+                            "market_context": market_context,
+                            "equity": equity,
+                            "broker_time": broker_time,
+                        },
+                    )
+                    cycle_counts[f"skip_{quality_reason}"] += 1
+                    continue
 
                 strategy_plan = None
                 risk_per_trade = SYMBOL_RISK_OVERRIDES.get(symbol, rules.max_risk_per_trade_pct)
@@ -767,6 +961,31 @@ def main():
                         ) * revenge_context["multiplier"]
                         size_reason = "dry_run"
 
+                if broker and not args.dry_run:
+                    stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
+                    if stop is None or target is None:
+                        print(f"{symbol}: skipped because broker stop levels are invalid")
+                        cycle_counts["skip_invalid_stops"] += 1
+                        append_jsonl(run_log, {"event": "candidate", "symbol": symbol, "reason": "invalid_stops", "signal": signal, "regime": regime, "session": session, "broker_time": broker_time})
+                        continue
+
+                expected_gross = expected_net = expected_risk = estimated_cost = None
+                if broker and not args.dry_run and symbol in {"EURUSD", "GBPUSD"}:
+                    info = broker.symbol_info(broker_symbol)
+                    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0) if info else 0.0
+                    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0) if info else 0.0
+                    point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+                    spread_cost = (spread_points or 0.0) * point / tick_size * tick_value * size if tick_value and tick_size and point else 0.0
+                    expected_gross = abs(target - price) / tick_size * tick_value * size if tick_value and tick_size else None
+                    expected_risk = risk_from_order(broker_symbol, price, stop, size, broker)
+                    estimated_cost = spread_cost + args.break_even_commission_round_turn * size
+                    expected_net = expected_gross - estimated_cost if expected_gross is not None else None
+                    if expected_net is not None and expected_risk is not None and expected_net < expected_risk:
+                        print(f"{symbol}: blocked by cost-adjusted target ({expected_net:.2f} net)")
+                        append_jsonl(run_log, {"event": "candidate", "symbol": symbol, "reason": "cost_exceeds_expected_reward", "expected_gross_reward": expected_gross, "expected_risk": expected_risk, "estimated_cost": estimated_cost, "expected_net_reward": expected_net, "score": signal_score, "regime": regime, "session": session, "broker_time": broker_time})
+                        cycle_counts["skip_cost_reward"] += 1
+                        continue
+
                 if size <= 0:
                     print(f"{symbol}: skipped due to sizing ({size_reason})")
                     cycle_counts["skip_zero_size"] += 1
@@ -787,6 +1006,13 @@ def main():
                         "signal": signal,
                         "score": signal_score,
                         "score_components": score_components,
+                        "regime": regime,
+                        "session": session,
+                        "market_context": market_context,
+                        "expected_gross_reward": expected_gross,
+                        "estimated_cost": estimated_cost,
+                        "expected_net_reward": expected_net,
+                        "expected_risk": expected_risk,
                         "risk_per_trade": risk_per_trade,
                         "price": price,
                         "size": size,
@@ -822,6 +1048,25 @@ def main():
                             },
                         )
                         continue
+                    group = position_group(symbol)
+                    group_positions = [
+                        position for position in owned_positions
+                        if position_group(symbol_aliases.get(str(getattr(position, "symbol", "")).upper(), str(getattr(position, "symbol", "")).upper())) == group
+                    ]
+                    max_group_positions = 1
+                    if len(group_positions) >= max_group_positions:
+                        print(f"{symbol}: skipped because {group} position group is full")
+                        cycle_counts["skip_position_group"] += 1
+                        append_jsonl(run_log, {"event": "candidate", "symbol": symbol, "reason": "position_group_full", "group": group, "group_positions": len(group_positions), "broker_time": broker_time})
+                        continue
+                    if group == "EUR_GBP":
+                        existing_group_risk = sum(risk_from_position(position, broker) for position in group_positions)
+                        planned_risk = risk_from_order(broker_symbol, price, stop, size, broker)
+                        if existing_group_risk + planned_risk > equity * EUR_GBP_RISK_CAP_PCT + 1e-9:
+                            print(f"{symbol}: skipped because EURUSD/GBPUSD combined risk cap is full")
+                            cycle_counts["skip_currency_risk_cap"] += 1
+                            append_jsonl(run_log, {"event": "candidate", "symbol": symbol, "reason": "eur_gbp_risk_cap", "existing_risk_usd": existing_group_risk, "planned_risk_usd": planned_risk, "cap_usd": equity * EUR_GBP_RISK_CAP_PCT, "broker_time": broker_time})
+                            continue
                     result = broker.place_order(
                         symbol=broker_symbol,
                         direction=signal,
