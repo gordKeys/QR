@@ -24,6 +24,7 @@ add_project_root()
 
 from scripts.strategy_router import StrategyRouter
 from engine.features import FeatureEngine
+from engine.risk_manager import RiskManager
 
 
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "XAUUSD"]
@@ -264,7 +265,20 @@ def later_target_reached(result, frames, lookahead_bars=288):
 def build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context):
     data = frame.iloc[max(0, index - 700): index + 1]
     broker.set_context(symbol, float(frame.close.iloc[index]))
-    plan = strategy.analyze_trade(data, broker=broker, symbol=symbol, equity=equity, signal=signal, price=float(frame.close.iloc[index])) if hasattr(strategy, "analyze_trade") else None
+    price = float(frame.close.iloc[index])
+    if hasattr(strategy, "analyze_trade"):
+        plan = strategy.analyze_trade(data, broker=broker, symbol=symbol, equity=equity, signal=signal, price=price)
+    else:
+        atr = float(frame.atr.iloc[index])
+        if not np.isfinite(atr) or atr <= 0:
+            return None
+        stop, target = RiskManager().calculate_sl_tp(
+            signal,
+            price,
+            atr,
+            tp_atr=5.0,
+        )
+        plan = {"signal": signal, "price": price, "stop": stop, "target": target}
     if not plan:
         return None
     info = broker.specs[symbol]
@@ -285,10 +299,13 @@ def simulate(frames, specs, news, initial_balance, slippage_points):
     positions, pending, trades, equity_rows = {}, {}, [], []
     balance, peak, consecutive_losses, pause_until = initial_balance, initial_balance, 0, None
     daily_base, current_day = initial_balance, None
+    daily_blocked = False
+    total_blocked = False
     for timestamp in timeline:
         prague_day = timestamp.tz_convert("Europe/Prague").date()
         if prague_day != current_day:
             current_day, daily_base = prague_day, balance
+            daily_blocked = False
         for symbol, position in list(positions.items()):
             if timestamp not in frames[symbol].index:
                 continue
@@ -337,9 +354,13 @@ def simulate(frames, specs, news, initial_balance, slippage_points):
                     trades.append(result)
                     del positions[symbol]
             equity = balance
+            if equity <= total_limit:
+                total_blocked = True
+            if equity <= daily_limit:
+                daily_blocked = True
         equity_rows.append({"time": timestamp, "balance": balance, "equity": equity, "daily_limit": daily_limit, "total_limit": total_limit, "peak_equity": peak})
         for symbol, frame in frames.items():
-            if timestamp not in frame.index or symbol in positions or len(positions) >= MAX_OPEN_POSITIONS or (pause_until and timestamp < pause_until):
+            if timestamp not in frame.index or symbol in positions or len(positions) >= MAX_OPEN_POSITIONS or (pause_until and timestamp < pause_until) or daily_blocked or total_blocked:
                 continue
             local = timestamp.tz_convert("Africa/Accra")
             if local.weekday() < 5 and 21 <= local.hour < 23:
