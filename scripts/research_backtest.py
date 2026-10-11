@@ -43,6 +43,38 @@ MAX_OPEN_POSITIONS = 3
 SLIPPAGE_POINTS = 1.0
 
 
+@dataclass(frozen=True)
+class ExperimentConfig:
+    name: str
+    regime_gate: bool = False
+    m30_gate: bool = False
+    session_guard: bool = False
+    cost_reward_gate: bool = False
+    no_chase_gate: bool = False
+    exit_management: bool = False
+    max_open_positions: int = MAX_OPEN_POSITIONS
+    shared_fx_risk: float | None = None
+    daily_soft_stop_pct: float | None = None
+
+
+EXPERIMENTS = {
+    "baseline": ExperimentConfig("baseline"),
+    "entry_quality": ExperimentConfig(
+        "entry_quality", regime_gate=True, m30_gate=True, session_guard=True,
+        cost_reward_gate=True, no_chase_gate=True,
+    ),
+    "entry_quality_exits": ExperimentConfig(
+        "entry_quality_exits", regime_gate=True, m30_gate=True, session_guard=True,
+        cost_reward_gate=True, no_chase_gate=True, exit_management=True,
+    ),
+    "full_controls": ExperimentConfig(
+        "full_controls", regime_gate=True, m30_gate=True, session_guard=True,
+        cost_reward_gate=True, no_chase_gate=True, exit_management=True,
+        max_open_positions=2, shared_fx_risk=0.01, daily_soft_stop_pct=0.02,
+    ),
+}
+
+
 @dataclass
 class Position:
     symbol: str
@@ -139,7 +171,7 @@ def download_history(symbols, output_dir, days, terminal_path):
             frame = frame.set_index("time").sort_index()
             frame["spread"] = frame.get("spread", 0).fillna(0)
             frame["tick_volume"] = frame.get("tick_volume", 0).fillna(0)
-            frames[canonical] = FeatureEngine().add_features(frame)
+            frames[canonical] = add_research_features(FeatureEngine().add_features(frame))
             info = mt5.symbol_info(selected.name)
             point = float(getattr(info, "point", 0.00001) or 0.00001)
             tick_size = float(getattr(info, "trade_tick_size", point) or point)
@@ -190,9 +222,97 @@ def load_cached(symbols, data_dir):
         if symbol not in specs:
             point = 0.01 if symbol == "XAUUSD" else 0.00001
             specs[symbol] = {"point": point, "digits": 2 if symbol == "XAUUSD" else 5, "tick_size": point, "tick_value": 100 * point if symbol == "XAUUSD" else 100000 * point, "contract_size": 100 if symbol == "XAUUSD" else 100000, "stops_level": 0, "volume_min": 0.01, "volume_max": 100, "volume_step": 0.01, "leverage": 100, "spread_price": float(frame.spread.median()) * point, "swap_long": 0, "swap_short": 0, "swap_3day": 3}
-        frames[symbol] = FeatureEngine().add_features(frame)
+        frames[symbol] = add_research_features(FeatureEngine().add_features(frame))
         specs[symbol] = SimpleNamespace(**specs[symbol])
     return frames, specs, names
+
+
+def add_research_features(frame):
+    """Add completed M15/M30 regime features without using future bars."""
+    frame = frame.copy()
+    for minutes, prefix in ((15, "m15"), (30, "m30")):
+        higher = frame[["open", "high", "low", "close", "tick_volume"]].resample(f"{minutes}min").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "tick_volume": "sum"}
+        ).dropna()
+        previous_close = higher.close.shift(1)
+        tr = pd.concat(
+            [higher.high - higher.low, (higher.high - previous_close).abs(), (higher.low - previous_close).abs()], axis=1
+        ).max(axis=1)
+        atr = tr.rolling(14).mean()
+        up = higher.high.diff()
+        down = -higher.low.diff()
+        plus_dm = up.where((up > down) & (up > 0), 0.0)
+        minus_dm = down.where((down > up) & (down > 0), 0.0)
+        plus_di = 100 * plus_dm.rolling(14).sum() / tr.rolling(14).sum()
+        minus_di = 100 * minus_dm.rolling(14).sum() / tr.rolling(14).sum()
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.rolling(14).mean()
+        ema = higher.close.ewm(span=20, adjust=False).mean()
+        bb_mid = higher.close.rolling(20).mean()
+        bb_width = (4 * higher.close.rolling(20).std() / bb_mid).replace([np.inf, -np.inf], np.nan)
+        chop = 100 * np.log10(tr.rolling(14).sum() / (higher.high.rolling(14).max() - higher.low.rolling(14).min())) / np.log10(14)
+        vwap = (higher.close * higher.tick_volume).rolling(20).sum() / higher.tick_volume.rolling(20).sum().replace(0, np.nan)
+        persistence = higher.close.diff().gt(0).rolling(8).mean().sub(0.5).abs() * 2
+        higher[f"{prefix}_adx"] = adx
+        higher[f"{prefix}_atr"] = atr
+        higher[f"{prefix}_atr_ratio"] = atr / atr.rolling(50).median()
+        higher[f"{prefix}_ema_slope"] = ema.diff(3)
+        higher[f"{prefix}_bb_width"] = bb_width
+        higher[f"{prefix}_chop"] = chop
+        higher[f"{prefix}_vwap_distance"] = (higher.close - vwap).abs()
+        higher[f"{prefix}_persistence"] = persistence
+        higher[f"{prefix}_ema"] = ema
+        # Shift higher-timeframe values so a 05-minute bar only sees a completed
+        # higher-timeframe candle.
+        columns = [column for column in higher.columns if column.startswith(prefix)]
+        mapped = higher[columns].shift(1).reindex(frame.index, method="ffill")
+        frame = frame.join(mapped)
+    return frame
+
+
+def regime_snapshot(frame, index):
+    row = frame.iloc[index]
+    atr = float(row.get("atr", 0.0) or 0.0)
+    checks = {
+        "adx_low_moderate": float(row.get("m15_adx", np.nan)) <= 22.0,
+        "atr_stable": 0.70 <= float(row.get("m15_atr_ratio", np.nan)) <= 1.50,
+        "ema_slope_flat": abs(float(row.get("m15_ema_slope", np.nan))) <= max(atr * 0.20, 1e-12),
+        "bb_width_stable": float(row.get("m15_bb_width", np.nan)) <= float(frame["m15_bb_width"].iloc[max(0, index - 100): index + 1].median()) * 1.50,
+        "choppy": float(row.get("m15_chop", np.nan)) >= 45.0,
+        "near_vwap": float(row.get("m15_vwap_distance", np.nan)) <= max(atr * 1.50, 1e-12),
+        "not_persistent": float(row.get("m15_persistence", np.nan)) <= 0.65,
+    }
+    valid = {key: bool(value) for key, value in checks.items() if not pd.isna(value)}
+    score = sum(valid.values())
+    adx = float(row.get("m15_adx", np.nan))
+    slope = abs(float(row.get("m15_ema_slope", np.nan)))
+    trending = bool(adx >= 25 and slope > max(atr * 0.25, 1e-12))
+    label = "ranging" if score >= 5 else "trending" if trending else "neutral"
+    return {"score": score, "label": label, "components": valid}
+
+
+def m30_allows_mean_reversion(frame, index):
+    row = frame.iloc[index]
+    adx = float(row.get("m30_adx", np.nan))
+    atr = float(row.get("atr", 0.0) or 0.0)
+    slope = abs(float(row.get("m30_ema_slope", np.nan)))
+    if pd.isna(adx) or pd.isna(slope) or atr <= 0:
+        return False
+    return adx <= 25 and slope <= atr * 0.45
+
+
+def session_name(timestamp):
+    hour = timestamp.tz_convert("Europe/London").hour
+    return "Asia" if hour < 8 else "London" if hour < 13 else "NewYork" if hour < 21 else "Late"
+
+
+def session_allows(symbol, score, timestamp):
+    session = session_name(timestamp)
+    if session == "Late":
+        return False
+    if symbol == "GBPUSD" and session in {"London", "NewYork"}:
+        return score >= 5
+    return True
 
 
 def load_news(path):
@@ -224,18 +344,7 @@ def price_value(position, price, specs):
 
 
 def regime_label(frame, index):
-    row = frame.iloc[index]
-    atr = float(row.get("atr", 0.0) or 0.0)
-    median_atr = float(frame["atr"].iloc[max(0, index - 100): index + 1].median())
-    close = float(row["close"])
-    ema50 = float(row.get("ema50", close))
-    if atr <= 0 or median_atr <= 0:
-        return "unknown"
-    if atr > median_atr * 2.0:
-        return "high_volatility"
-    if abs(close - ema50) > atr * 2.0:
-        return "trending"
-    return "ranging"
+    return regime_snapshot(frame, index)["label"]
 
 
 def commission(volume):
@@ -291,7 +400,9 @@ def build_plan(symbol, frame, index, signal, score, components, equity, broker, 
     return Position(symbol, signal, frame.index[index], float(plan["price"]), float(plan["stop"]), float(plan["target"]), volume, risk, score, components, strategy.__class__.__name__, regime_label(frame, index), news_context, index, commission(volume), info.spread_price * volume * info.tick_value / info.tick_size)
 
 
-def simulate(frames, specs, news, initial_balance, slippage_points):
+def simulate(frames, specs, news, initial_balance, slippage_points, config=None, candidate_rows=None):
+    config = config or EXPERIMENTS["baseline"]
+    candidate_rows = candidate_rows if candidate_rows is not None else []
     router = StrategyRouter()
     broker = ResearchBroker(frames, specs)
     signals = {symbol: router.get_strategy(symbol).generate_signals(frame) for symbol, frame in frames.items()}
@@ -324,6 +435,15 @@ def simulate(frames, specs, news, initial_balance, slippage_points):
                 reason, exit_price = "SL", position.stop
             elif target_hit:
                 reason, exit_price = "TP", position.target
+            current_index = frames[symbol].index.get_loc(timestamp)
+            if config.exit_management and reason is None:
+                current_signal = int(signals[symbol].iloc[current_index])
+                held_bars = max(0, current_index - position.entry_index)
+                initial_risk = max(position.risk_usd, 1e-12)
+                if current_signal == -position.direction and held_bars >= 3:
+                    reason, exit_price = "setup_invalidation", float(bar.close)
+                elif held_bars >= 12 and (floating <= 0 or position.mfe_usd < initial_risk * 0.25):
+                    reason, exit_price = "time_stop", float(bar.close)
             if reason is None and timestamp.weekday() >= 5:
                 reason, exit_price = "weekend_gap", float(bar.open)
             if reason is not None:
@@ -360,27 +480,76 @@ def simulate(frames, specs, news, initial_balance, slippage_points):
                 daily_blocked = True
         equity_rows.append({"time": timestamp, "balance": balance, "equity": equity, "daily_limit": daily_limit, "total_limit": total_limit, "peak_equity": peak})
         for symbol, frame in frames.items():
-            if timestamp not in frame.index or symbol in positions or len(positions) >= MAX_OPEN_POSITIONS or (pause_until and timestamp < pause_until) or daily_blocked or total_blocked:
+            if timestamp not in frame.index or symbol in positions or len(positions) >= config.max_open_positions or (pause_until and timestamp < pause_until) or daily_blocked or total_blocked:
                 continue
             local = timestamp.tz_convert("Africa/Accra")
             if local.weekday() < 5 and 21 <= local.hour < 23:
                 continue
             index = frame.index.get_loc(timestamp)
             signal = int(signals[symbol].iloc[index])
-            if not signal or news_blocked(news, symbol, timestamp, 5, 10):
+            if not signal:
                 continue
             strategy = router.get_strategy(symbol)
             score, components = None, {}
             if hasattr(strategy, "evaluate_latest"):
                 _, score, components = strategy.evaluate_latest(frame.iloc[max(0, index - 700): index + 1], spread_points=float(frame.spread.iloc[index]))
-            news_context = "near_news" if news_blocked(news, symbol, timestamp, 60, 60) else "no_news"
-            plan = build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context)
-            if plan is not None:
+            regime = regime_snapshot(frame, index)
+            news_near = news_blocked(news, symbol, timestamp, 60, 60)
+            news_block = news_blocked(news, symbol, timestamp, 5, 10)
+            news_context = "near_news" if news_near else "no_news"
+            rejection = None
+            if news_block:
+                rejection = "news_blackout"
+            elif config.session_guard and not session_allows(symbol, int(score or 0), timestamp):
+                rejection = "session_filter"
+            elif config.regime_gate and symbol in {"EURUSD", "GBPUSD"} and regime["label"] != "ranging":
+                rejection = "regime_filter"
+            elif config.m30_gate and symbol in {"EURUSD", "GBPUSD"} and not m30_allows_mean_reversion(frame, index):
+                rejection = "m30_regime_filter"
+            elif config.no_chase_gate and components.get("current_z") is not None and abs(float(components["current_z"])) > 2.75:
+                rejection = "no_chase"
+            plan = None if rejection else build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context)
+            if rejection is None and plan is None:
+                rejection = "invalid_plan_or_margin"
+            if rejection is None and config.cost_reward_gate:
+                info = specs[symbol]
+                gross_target = abs(plan.target - plan.entry) * plan.volume * info.tick_value / info.tick_size
+                round_trip_cost = plan.entry_commission * 2 + plan.entry_spread * 2 + slippage_points * info.point * plan.volume * info.tick_value / info.tick_size * 2
+                if gross_target - round_trip_cost < plan.risk_usd:
+                    rejection = "insufficient_net_reward"
+            if rejection is None and config.shared_fx_risk is not None and symbol in {"EURUSD", "GBPUSD"}:
+                current_fx_risk = sum(pos.risk_usd for pos in positions.values() if pos.symbol in {"EURUSD", "GBPUSD"})
+                if current_fx_risk + plan.risk_usd > equity * config.shared_fx_risk:
+                    rejection = "shared_fx_risk_cap"
+            if rejection is None and config.daily_soft_stop_pct is not None and equity <= daily_base * (1 - config.daily_soft_stop_pct):
+                rejection = "daily_soft_stop"
+            candidate_rows.append({
+                "experiment": config.name,
+                "symbol": symbol,
+                "time": timestamp,
+                "signal": signal,
+                "score": score,
+                "score_components": json.dumps(components, default=str),
+                "regime_score": regime["score"],
+                "regime": regime["label"],
+                "regime_components": json.dumps(regime["components"], default=str),
+                "m30_allows_mean_reversion": m30_allows_mean_reversion(frame, index),
+                "session": session_name(timestamp),
+                "news_context": news_context,
+                "spread_points": float(frame.spread.iloc[index]),
+                "atr": float(frame.atr.iloc[index]),
+                "entry_price": plan.entry if plan else None,
+                "stop": plan.stop if plan else None,
+                "target": plan.target if plan else None,
+                "accepted": rejection is None,
+                "rejection_reason": rejection or "accepted",
+            })
+            if plan is not None and rejection is None:
                 pending[symbol] = (index + 1, plan)
         for symbol, (entry_index, plan) in list(pending.items()):
             frame = frames[symbol]
             if entry_index < len(frame) and frame.index[entry_index] == timestamp:
-                if symbol not in positions and len(positions) < MAX_OPEN_POSITIONS:
+                if symbol not in positions and len(positions) < config.max_open_positions:
                     bar = frame.iloc[entry_index]
                     spec = specs[symbol]
                     entry = float(bar.open) + (spec.spread_price / 2 if plan.direction == 1 else -spec.spread_price / 2)
@@ -435,6 +604,7 @@ def main():
     parser.add_argument("--news-csv", help="CSV with UTC time,currency,title columns")
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--slippage-points", type=float, default=SLIPPAGE_POINTS)
+    parser.add_argument("--profile", choices=["baseline", "entry_quality", "entry_quality_exits", "full_controls", "suite"], default="suite")
     args = parser.parse_args()
     data_dir, output = Path(args.data_dir), Path(args.output)
     cached = all(list(data_dir.glob(f"*{symbol}*_M5.csv")) for symbol in SYMBOLS)
@@ -444,13 +614,22 @@ def main():
     else:
         frames, specs, names = load_cached(SYMBOLS, data_dir)
     news = load_news(args.news_csv)
-    trades, equity = simulate(frames, specs, news, args.initial_balance, args.slippage_points)
     output.mkdir(parents=True, exist_ok=True)
-    trades.to_csv(output / "trades.csv", index=False)
-    equity.to_csv(output / "equity.csv", index=False)
-    report = {"settings": {**vars(args), "symbols": SYMBOLS, "risk_by_symbol": RISK_BY_SYMBOL, "commission_round_turn_per_lot": COMMISSION_PER_LOT_ROUND_TURN, "daily_loss_pct": DAILY_LOSS_PCT, "total_loss_pct": TOTAL_LOSS_PCT, "max_open_positions": MAX_OPEN_POSITIONS}, "broker_symbols": names, "metrics": report_metrics(trades, equity, args.initial_balance), "limitations": ["News blackout is applied only when --news-csv is supplied; live calendar data is not a historical archive.", "Same-bar SL and TP is resolved conservatively as SL.", "MT5 bar data cannot reproduce tick ordering; slippage is modeled as a fixed point cost.", "Swap values depend on broker symbol settings and are captured at download time."]}
+    profile_names = list(EXPERIMENTS) if args.profile == "suite" else [args.profile]
+    reports = {}
+    all_candidates = []
+    for profile_name in profile_names:
+        candidates = []
+        trades, equity = simulate(frames, specs, news, args.initial_balance, args.slippage_points, EXPERIMENTS[profile_name], candidates)
+        trades.to_csv(output / f"trades_{profile_name}.csv", index=False)
+        equity.to_csv(output / f"equity_{profile_name}.csv", index=False)
+        metrics = report_metrics(trades, equity, args.initial_balance)
+        reports[profile_name] = {"config": asdict(EXPERIMENTS[profile_name]), "metrics": metrics}
+        all_candidates.extend(candidates)
+        print(json.dumps({"profile": profile_name, **metrics}, indent=2, default=str))
+    pd.DataFrame(all_candidates).to_csv(output / "candidates.csv", index=False)
+    report = {"settings": {**vars(args), "symbols": SYMBOLS, "risk_by_symbol": RISK_BY_SYMBOL, "commission_round_turn_per_lot": COMMISSION_PER_LOT_ROUND_TURN, "daily_loss_pct": DAILY_LOSS_PCT, "total_loss_pct": TOTAL_LOSS_PCT}, "broker_symbols": names, "experiments": reports, "limitations": ["News blackout is applied only when --news-csv is supplied; live calendar data is not a historical archive.", "Same-bar SL and TP is resolved conservatively as SL.", "MT5 bar data cannot reproduce tick ordering; slippage is modeled as a fixed point cost.", "Swap values depend on broker symbol settings and are captured at download time.", "The experiment suite changes one group of controls at a time; it is for research and does not alter live execution."]}
     (output / "report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    print(json.dumps(report["metrics"], indent=2, default=str))
 
 
 if __name__ == "__main__":
