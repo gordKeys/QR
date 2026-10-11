@@ -22,6 +22,7 @@ class FTMOXAUUSD(BaseStrategy):
         forex_hours=range(8, 22),
         volume_factor=1.05,
         trend_timeframe=None,
+        require_trend_alignment=True,
     ):
         self.rr = rr
         self.atr_mult = atr_mult
@@ -38,6 +39,7 @@ class FTMOXAUUSD(BaseStrategy):
         self.forex_hours = set(forex_hours)
         self.volume_factor = volume_factor
         self.trend_timeframe = trend_timeframe
+        self.require_trend_alignment = require_trend_alignment
 
     def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -170,9 +172,9 @@ class FTMOXAUUSD(BaseStrategy):
             return None
 
         trend = self._trend_direction(broker, symbol)
-        if signal == 1 and trend == "DOWN":
+        if self.require_trend_alignment and signal == 1 and trend == "DOWN":
             return None
-        if signal == -1 and trend == "UP":
+        if self.require_trend_alignment and signal == -1 and trend == "UP":
             return None
 
         atr = float(current["atr"])
