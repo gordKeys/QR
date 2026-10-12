@@ -24,7 +24,7 @@ from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOCom
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.015,
+    "EURUSD": 0.02,
     "GBPUSD": 0.015,
     "XAUUSD": 0.01,
 }
@@ -36,8 +36,8 @@ SYMBOL_TP_ATR_BASE = {"EURUSD": 4.8, "GBPUSD": 3.5, "XAUUSD": 1.75}
 DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
 BREAK_EVEN_ENABLED = False
 EUR_GBP_RISK_CAP_PCT = 0.03
-DAILY_SOFT_STOP_PCT = 0.035
-HARD_LOSS_STOP_PCT = 0.04
+DAILY_SOFT_STOP_PCT = 0.03
+HARD_LOSS_STOP_PCT = 0.038
 BLOCK_NEW_YORK_ENTRIES = True
 POSITION_GROUPS = {
     "EUR_GBP": {"EURUSD", "GBPUSD"},
@@ -450,7 +450,7 @@ def main():
     print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
     print(f"FTMO account type: {args.account_type}")
     print("Portfolio limit: 2 positions (max 1 EURUSD/GBPUSD group + 1 other)")
-    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.00%")
+    print("Risk: EURUSD=2.00%, GBPUSD=1.50%, XAUUSD=1.00%")
     print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
     print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
     print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
