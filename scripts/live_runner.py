@@ -26,12 +26,15 @@ BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
     "EURUSD": 0.015,
     "GBPUSD": 0.015,
-    "XAUUSD": 0.015,
+    "XAUUSD": 0.01,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
-    "EURUSD": 3.5,
-    "GBPUSD": 4.0,
+    "EURUSD": 4.8,
 }
+SYMBOL_SL_ATR_BASE = {"EURUSD": 2.5, "GBPUSD": 2.0, "XAUUSD": 1.25}
+SYMBOL_TP_ATR_BASE = {"EURUSD": 4.8, "GBPUSD": 3.5, "XAUUSD": 1.75}
+DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
+BREAK_EVEN_ENABLED = False
 EUR_GBP_RISK_CAP_PCT = 0.03
 DAILY_SOFT_STOP_PCT = 0.035
 HARD_LOSS_STOP_PCT = 0.04
@@ -44,6 +47,28 @@ POSITION_GROUPS = {
 def position_group(symbol):
     canonical = symbol.upper()
     return "EUR_GBP" if canonical in POSITION_GROUPS["EUR_GBP"] else "OTHER"
+
+
+def dynamic_atr_multipliers(symbol, regime, score_components):
+    sl = float(SYMBOL_SL_ATR_BASE[symbol])
+    tp = float(SYMBOL_TP_ATR_BASE[symbol])
+    atr_ratio = float(regime.get("m15", {}).get("atr_ratio") or 999.0)
+    if atr_ratio >= 1.20:
+        sl, tp = sl * 1.15, tp * 1.10
+    elif atr_ratio <= 0.80:
+        sl, tp = sl * 0.90, tp * 0.85
+    if symbol == "GBPUSD":
+        z = abs(float((score_components or {}).get("current_z") or 0.0))
+        if z >= 2.40:
+            tp *= 1.10
+        if regime.get("m15", {}).get("label") == "ranging":
+            sl, tp = sl * 0.95, tp * 0.95
+        sl = min(3.5, max(1.5, sl))
+        tp = min(5.0, max(2.5, tp))
+    else:
+        sl = min(2.5, max(1.0, sl))
+        tp = min(3.5, max(1.5, tp))
+    return round(sl, 4), round(tp, 4)
 
 
 def session_name(timestamp):
@@ -422,10 +447,10 @@ def main():
             f"gap_trades={args.revenge_gap_trades}"
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
-    print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
+    print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
     print(f"FTMO account type: {args.account_type}")
     print("Portfolio limit: 2 positions (max 1 EURUSD/GBPUSD group + 1 other)")
-    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.50%")
+    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.00%")
     print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
     print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
     print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
@@ -704,7 +729,7 @@ def main():
                             )
 
                         break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
-                        if not state.get("break_even_moved") and current_profit >= break_even_trigger:
+                        if BREAK_EVEN_ENABLED and not state.get("break_even_moved") and current_profit >= break_even_trigger:
                             break_even_sl = estimate_break_even_stop(
                                 current_position,
                                 broker,
@@ -896,6 +921,11 @@ def main():
 
                 strategy_plan = None
                 risk_per_trade = SYMBOL_RISK_OVERRIDES.get(symbol, rules.max_risk_per_trade_pct)
+                if symbol in DYNAMIC_ATR_SYMBOLS:
+                    sl_atr, tp_atr = dynamic_atr_multipliers(symbol, regime, score_components)
+                else:
+                    sl_atr = float(SYMBOL_SL_ATR_BASE.get(symbol, 2.5))
+                    tp_atr = float(SYMBOL_TP_ATR_OVERRIDES.get(symbol, SYMBOL_TP_ATR_BASE.get(symbol, 5.0)))
                 analyze_trade = getattr(strategy, "analyze_trade", None)
                 if callable(analyze_trade):
                     try:
@@ -922,7 +952,8 @@ def main():
                         signal,
                         price,
                         atr,
-                        tp_atr=SYMBOL_TP_ATR_OVERRIDES.get(symbol, 5.0),
+                        sl_atr=sl_atr,
+                        tp_atr=tp_atr,
                     )
 
                     if broker and not args.dry_run:
@@ -961,6 +992,37 @@ def main():
                         ) * revenge_context["multiplier"]
                         size_reason = "dry_run"
 
+                if symbol in DYNAMIC_ATR_SYMBOLS:
+                    if signal == 1:
+                        stop, target = price - atr * sl_atr, price + atr * tp_atr
+                    else:
+                        stop, target = price + atr * sl_atr, price - atr * tp_atr
+                    if broker and not args.dry_run:
+                        stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
+                        if stop is None or target is None:
+                            print(f"{symbol}: skipped because dynamic broker stop levels are invalid")
+                            cycle_counts["skip_invalid_stops"] += 1
+                            continue
+                        size, size_reason = calculate_trade_volume(
+                            broker=broker,
+                            symbol=broker_symbol,
+                            direction=signal,
+                            entry_price=price,
+                            stop_price=stop,
+                            account_equity=equity,
+                            risk_per_trade=risk_per_trade,
+                            size_multiplier=revenge_context["multiplier"],
+                        )
+                    else:
+                        size = risk.calculate_position_size(
+                            equity,
+                            price,
+                            stop,
+                            atr=atr,
+                            risk_per_trade=risk_per_trade,
+                        ) * revenge_context["multiplier"]
+                        size_reason = "dynamic_dry_run"
+
                 if broker and not args.dry_run:
                     stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
                     if stop is None or target is None:
@@ -995,7 +1057,8 @@ def main():
                 print(
                     f"{symbol}: strategy={strategy.__class__.__name__} signal={signal} "
                     f"score={signal_score}/5 risk={risk_per_trade * 100:.2f}% "
-                    f"price={price:.5f} size={size:.2f} sl={stop:.5f} tp={target:.5f}"
+                    f"price={price:.5f} size={size:.2f} sl={stop:.5f} tp={target:.5f} "
+                    f"sl_atr={sl_atr:.2f} tp_atr={tp_atr:.2f}"
                 )
                 append_jsonl(
                     run_log,
@@ -1018,6 +1081,8 @@ def main():
                         "size": size,
                         "stop": stop,
                         "target": target,
+                        "sl_atr": sl_atr,
+                        "tp_atr": tp_atr,
                         "equity": equity,
                         "size_reason": size_reason,
                         "revenge_mode": revenge_context["enabled"],
