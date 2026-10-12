@@ -49,6 +49,16 @@ def position_group(symbol):
     return "EUR_GBP" if canonical in POSITION_GROUPS["EUR_GBP"] else "OTHER"
 
 
+def account_state_path(account_info):
+    login = getattr(account_info, "login", "unknown")
+    server = getattr(account_info, "server", "unknown")
+    account_key = "".join(
+        character if character.isalnum() else "_"
+        for character in f"{login}_{server}"
+    )
+    return Path("logs") / f"ftmo_compliance_state_{account_key}.json"
+
+
 def dynamic_atr_multipliers(symbol, regime, score_components):
     sl = float(SYMBOL_SL_ATR_BASE[symbol])
     tp = float(SYMBOL_TP_ATR_BASE[symbol])
@@ -473,12 +483,16 @@ def main():
             live_equity = float(getattr(account_info, "equity", 0.0) or 0.0) if account_info else None
             live_balance = float(getattr(account_info, "balance", 0.0) or 0.0) if account_info else None
             if live_equity is not None and live_equity > 0:
+                connected_balance = live_balance or live_equity
+                rules.initial_balance = connected_balance
+                rules.equity_peak = connected_balance
                 hard_drawdown.reset_session(live_equity)
-                reference_balance = live_balance or live_equity
+                reference_balance = connected_balance
                 compliance = FTMOComplianceEngine(
                     FTMOComplianceConfig(
                         account_type=args.account_type,
                         initial_balance=args.ftmo_initial_capital or live_balance or live_equity,
+                        state_path=account_state_path(account_info),
                         market_close_buffer_minutes=args.market_close_buffer_minutes,
                         news_calendar_url=args.news_calendar_url or FTMOComplianceConfig().news_calendar_url,
                         news_pre_minutes=args.news_pre_minutes,
