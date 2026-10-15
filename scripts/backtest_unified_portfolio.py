@@ -141,19 +141,19 @@ def xau_trailing_signal(frame: pd.DataFrame, index: int):
     return 0, None
 
 
-def signal_and_plan(symbol, frame, index, mode):
+def signal_and_plan(symbol, frame, index, mode, precomputed_signal=None):
     row = frame.iloc[index]
     current_atr = atr(frame, index)
     if current_atr <= 0:
         return 0, None, "missing_atr"
     if symbol == "EURUSD":
-        signal = int(MeanReversion(lookback=20, entry_z=2.0 if mode == "current" else 1.5).generate_signals(frame).iloc[index])
+        signal = int(precomputed_signal if precomputed_signal is not None else MeanReversion(lookback=20, entry_z=2.0 if mode == "current" else 1.5).generate_signals(frame).iloc[index])
         sl_atr, tp_atr = 2.5, 5.0
     elif symbol == "GBPUSD":
-        signal = int(MeanReversion(lookback=20, entry_z=2.0 if mode == "current" else 1.5).generate_signals(frame).iloc[index])
+        signal = int(precomputed_signal if precomputed_signal is not None else MeanReversion(lookback=20, entry_z=2.0 if mode == "current" else 1.5).generate_signals(frame).iloc[index])
         sl_atr, tp_atr = 2.5, 4.0
     else:
-        signal = int(FTMOXAUUSD(min_score=4).generate_signals(frame).iloc[index])
+        signal = int(precomputed_signal if precomputed_signal is not None else FTMOXAUUSD(min_score=4).generate_signals(frame).iloc[index])
         sl_atr, tp_atr = 1.5, 2.25
     if not signal:
         return 0, None, "no_signal"
@@ -175,6 +175,13 @@ def run_profile(profile: Profile, frames, news, initial_balance: float):
     trades = []
     equity_rows = []
     timeline = sorted(set().union(*(frame.index for frame in frames.values())))
+    signal_cache = {}
+    for symbol, mode in (("EURUSD", profile.eur_mode), ("GBPUSD", profile.gbp_mode)):
+        signal_cache[symbol] = MeanReversion(
+            lookback=20,
+            entry_z=2.0 if mode == "current" else 1.5,
+        ).generate_signals(frames[symbol])
+    signal_cache["XAUUSD"] = FTMOXAUUSD(min_score=4).generate_signals(frames["XAUUSD"])
 
     for timestamp in timeline:
         day = timestamp.tz_convert(PRAGUE).date()
@@ -221,14 +228,14 @@ def run_profile(profile: Profile, frames, news, initial_balance: float):
             index = frame.index.get_loc(timestamp)
             if symbol in {"EURUSD", "GBPUSD"}:
                 mode = profile.eur_mode if symbol == "EURUSD" else profile.gbp_mode
-                signal, plan, reason = signal_and_plan(symbol, frame, index, mode)
+                signal, plan, reason = signal_and_plan(symbol, frame, index, mode, signal_cache[symbol].iloc[index])
                 if not signal:
                     continue
                 entry, stop, target, entry_atr = plan
                 strategy_name = f"mean_reversion_{mode}"
                 position_risk = risk[symbol]
             elif symbol == "XAUUSD":
-                signal, plan, reason = signal_and_plan(symbol, frame, index, "current")
+                signal, plan, reason = signal_and_plan(symbol, frame, index, "current", signal_cache[symbol].iloc[index])
                 candidates = []
                 if signal and plan:
                     candidates.append(("xau_current", signal, plan, profile.xau_current_risk))
