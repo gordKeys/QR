@@ -18,6 +18,170 @@ from revenge_mode import RevengeTradeManager
 from live_protection import HardDrawdownGuard, SymbolCircuitBreaker
 from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
+from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOComplianceEngine
+from xau_dual_runner import (
+    CURRENT_MAGIC,
+    TRAILING_MAGIC,
+    add_breakout_features,
+    calculate_volume as calculate_xau_volume,
+    manage_trailing,
+    trailing_plan,
+)
+
+
+BOT_MAGIC = 26072026
+SYMBOL_RISK_OVERRIDES = {
+    "EURUSD": 0.015,
+    "GBPUSD": 0.015,
+    "XAUUSD": 0.01,
+}
+SYMBOL_TP_ATR_OVERRIDES = {
+    "EURUSD": 3.5,
+}
+SYMBOL_SL_ATR_BASE = {"EURUSD": 2.5, "GBPUSD": 2.0, "XAUUSD": 1.25}
+SYMBOL_TP_ATR_BASE = {"EURUSD": 3.5, "GBPUSD": 3.5, "XAUUSD": 1.75}
+DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
+BREAK_EVEN_ENABLED = False
+EUR_GBP_RISK_CAP_PCT = 0.03
+DAILY_SOFT_STOP_PCT = 0.03
+HARD_LOSS_STOP_PCT = 0.038
+BLOCK_NEW_YORK_ENTRIES = True
+DUAL_XAU_ENABLED = True
+XAU_CURRENT_RISK = 0.005
+XAU_TRAILING_RISK = 0.005
+POSITION_GROUPS = {
+    "EUR_GBP": {"EURUSD", "GBPUSD"},
+}
+
+
+def position_group(symbol):
+    canonical = symbol.upper()
+    return "EUR_GBP" if canonical in POSITION_GROUPS["EUR_GBP"] else "OTHER"
+
+
+def account_state_path(account_info):
+    login = getattr(account_info, "login", "unknown")
+    server = getattr(account_info, "server", "unknown")
+    account_key = "".join(
+        character if character.isalnum() else "_"
+        for character in f"{login}_{server}"
+    )
+    return Path("logs") / f"ftmo_compliance_state_{account_key}.json"
+
+
+def dynamic_atr_multipliers(symbol, regime, score_components):
+    sl = float(SYMBOL_SL_ATR_BASE[symbol])
+    tp = float(SYMBOL_TP_ATR_BASE[symbol])
+    atr_ratio = float(regime.get("m15", {}).get("atr_ratio") or 999.0)
+    if atr_ratio >= 1.20:
+        sl, tp = sl * 1.15, tp * 1.10
+    elif atr_ratio <= 0.80:
+        sl, tp = sl * 0.90, tp * 0.85
+    if symbol == "GBPUSD":
+        z = abs(float((score_components or {}).get("current_z") or 0.0))
+        if z >= 2.40:
+            tp *= 1.10
+        if regime.get("m15", {}).get("label") == "ranging":
+            sl, tp = sl * 0.95, tp * 0.95
+        sl = min(3.5, max(1.5, sl))
+        tp = min(5.0, max(2.5, tp))
+    else:
+        sl = min(2.5, max(1.0, sl))
+        tp = min(3.5, max(1.5, tp))
+    return round(sl, 4), round(tp, 4)
+
+
+def session_name(timestamp):
+    from zoneinfo import ZoneInfo
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    hour = timestamp.astimezone(ZoneInfo("Europe/London")).hour
+    if hour < 8:
+        return "Asia"
+    if hour < 13:
+        return "London"
+    if hour < 21:
+        return "NewYork"
+    return "Late"
+
+
+def risk_from_position(position, broker):
+    stop = float(getattr(position, "sl", 0.0) or 0.0)
+    entry = float(getattr(position, "price_open", 0.0) or 0.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    if stop <= 0 or entry <= 0 or volume <= 0:
+        return 0.0
+    info = broker.symbol_info(getattr(position, "symbol", ""))
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0) if info else 0.0
+    if tick_value <= 0 or tick_size <= 0:
+        return 0.0
+    return abs(entry - stop) / tick_size * tick_value * volume
+
+
+def risk_from_order(symbol, entry, stop, volume, broker):
+    info = broker.symbol_info(symbol)
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0) if info else 0.0
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0) if info else 0.0
+    if tick_value <= 0 or tick_size <= 0:
+        return 0.0
+    return abs(entry - stop) / tick_size * tick_value * volume
+
+
+def entry_context(data, regime, signal, spread_points):
+    timestamp = data.index[-1].to_pydatetime()
+    current = data.iloc[-1]
+    candle_range = float(current["high"] - current["low"])
+    body_ratio = abs(float(current["close"] - current["open"])) / candle_range if candle_range > 0 else 0.0
+    atr = float(current.get("atr", 0.0) or 0.0)
+    recent_high = float(data["high"].tail(96).max())
+    recent_low = float(data["low"].tail(96).min())
+    close = float(current["close"])
+    distance_to_session_high_atr = (recent_high - close) / atr if atr > 0 else None
+    distance_to_session_low_atr = (close - recent_low) / atr if atr > 0 else None
+    components = {
+        "m15_regime_score": regime["m15"].get("score"),
+        "m15_regime_label": regime["m15"].get("label"),
+        "m30_regime_score": regime["m30"].get("score"),
+        "m30_regime_label": regime["m30"].get("label"),
+        "m30_adx": regime["m30"].get("adx"),
+        "m30_ema_slope": regime["m30"].get("ema_slope"),
+        "candle_body_ratio": body_ratio,
+        "distance_to_session_high_atr": distance_to_session_high_atr,
+        "distance_to_session_low_atr": distance_to_session_low_atr,
+        "spread_points": spread_points,
+        "atr": atr,
+    }
+    m30_slope = regime["m30"].get("ema_slope")
+    m30_atr = regime["m30"].get("atr") or 0.0
+    opposing_m30 = bool(
+        signal and regime["m30"].get("label") == "trending" and m30_slope is not None
+        and abs(m30_slope) > m30_atr * 0.20 and (1 if m30_slope > 0 else -1) == -signal
+    )
+    components["m30_opposes_reversion"] = opposing_m30
+    return session_name(timestamp), components
+
+
+def entry_quality_block(symbol, data, regime, signal, score, score_components, spread_points):
+    if symbol in {"EURUSD", "GBPUSD"}:
+        session, context = entry_context(data, regime, signal, spread_points)
+        if session != "Asia":
+            return "asia_only_session", session, context
+        if regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging":
+            return "m15_regime_not_ranging", session, context
+        if regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
+            return "m30_opposes_reversion", session, context
+        if context["candle_body_ratio"] < 0.20 or context["candle_body_ratio"] > 0.90:
+            return "poor_candle_quality", session, context
+        current_z = score_components.get("current_z") if score_components else None
+        if current_z is not None and abs(float(current_z)) > 3.5:
+            return "no_chase_extreme", session, context
+        if score is not None and score < 4:
+            return "score_below_4", session, context
+        return None, session, context
+    session, context = entry_context(data, regime, signal, spread_points)
+    return None, session, context
 
 
 def build_data_for_symbol(symbol, broker=None):
@@ -100,6 +264,103 @@ def format_status(symbol, consecutive_losses, cooldown_until, last_closed_pnl):
         f"cooldown_remaining={cooldown_text} | "
         f"last_closed_pnl={pnl_text}"
     )
+
+
+def filter_owned_positions(positions):
+    return [
+        position for position in positions
+        if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+
+
+def filter_main_positions(positions):
+    return [position for position in positions if getattr(position, "magic", None) == BOT_MAGIC]
+
+
+def load_xau_dual_data(broker, broker_symbol):
+    rates = broker.rates_copy(broker_symbol, broker.mt5.TIMEFRAME_M5, 3000)
+    if rates is None or len(rates) == 0:
+        return None
+    frame = pd.DataFrame(rates)
+    frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+    frame = frame.set_index("time").sort_index()
+    columns = ["open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
+    frame = frame[[column for column in columns if column in frame.columns]]
+    return add_breakout_features(FeatureEngine().add_features(frame))
+
+
+def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, trade_states):
+    data = load_xau_dual_data(broker, broker_symbol)
+    if data is None or data.empty:
+        print("XAUUSD dual: no data")
+        return
+    positions = [
+        position for position in broker.positions_get()
+        if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+    for position in positions:
+        if getattr(position, "magic", None) == TRAILING_MAGIC:
+            manage_trailing(broker, broker_symbol, data, position, trade_states)
+    xau_positions = [
+        position for position in positions
+        if getattr(position, "magic", None) in {CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+    tick = broker.symbol_tick(broker_symbol)
+    if tick is None or equity <= 0:
+        return
+    current_strategy = router.get_strategy("XAUUSD")
+    current_signal = int(current_strategy.generate_signals(data).iloc[-1])
+    trailing_signal, trailing_setup = trailing_plan(data)
+    candidates = [
+        ("current", current_signal, CURRENT_MAGIC, XAU_CURRENT_RISK),
+        ("trailing", trailing_signal, TRAILING_MAGIC, XAU_TRAILING_RISK),
+    ]
+    for name, signal, magic, risk_pct in candidates:
+        if not signal or len(positions) >= max_positions or any(
+            getattr(position, "magic", None) == magic for position in xau_positions
+        ):
+            continue
+        price = float(tick.ask if signal == 1 else tick.bid)
+        if name == "trailing":
+            if not trailing_setup:
+                continue
+            stop = float(trailing_setup["stop"])
+            target = float(trailing_setup["target"])
+            atr = float(trailing_setup["atr"])
+        else:
+            atr = float(data["atr"].iloc[-1])
+            regime = classify_regime(data)
+            score_components = {}
+            sl_atr, tp_atr = dynamic_atr_multipliers("XAUUSD", regime, score_components)
+            stop = price - atr * sl_atr if signal == 1 else price + atr * sl_atr
+            target = price + atr * tp_atr if signal == 1 else price - atr * tp_atr
+        stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
+        if stop is None or target is None:
+            print(f"XAUUSD {name}: invalid broker stop levels")
+            continue
+        volume = calculate_xau_volume(broker, broker_symbol, signal, price, stop, equity, risk_pct)
+        if volume <= 0:
+            print(f"XAUUSD {name}: insufficient margin or invalid volume")
+            continue
+        result = broker.place_order(
+            symbol=broker_symbol,
+            direction=signal,
+            volume=volume,
+            stop_loss=stop,
+            take_profit=target,
+            price=price,
+            comment=f"QuantFX-XAU-{name}",
+            magic=magic,
+        )
+        print(
+            f"XAUUSD {name}: signal={signal} risk={risk_pct:.2%} "
+            f"size={volume:.2f} sl={stop:.2f} tp={target:.2f} result={result}"
+        )
+        if result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE:
+            positions = [
+                position for position in broker.positions_get()
+                if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+            ]
 
 
 def calculate_trade_volume(
@@ -277,6 +538,15 @@ def main():
         f"trigger=${args.profit_lock_trigger_usd:.2f} | "
         f"locked=${args.profit_lock_usd:.2f}"
     )
+    print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
+    print(f"FTMO account type: {args.account_type}")
+    print("Portfolio limit: 2 positions globally")
+    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.00% total (0.50% per XAU sleeve)")
+    print(f"Dual XAU runner: {'ON' if DUAL_XAU_ENABLED else 'OFF'} | magic={CURRENT_MAGIC}/{TRAILING_MAGIC}")
+    print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
+    print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
+    print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
+    print(f"New York entries: {'BLOCKED' if BLOCK_NEW_YORK_ENTRIES else 'ALLOWED'}")
 
     broker = None
     if not args.dry_run:
@@ -352,6 +622,8 @@ def main():
                 )
 
         live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
+        if DUAL_XAU_ENABLED:
+            live_symbols = [item for item in live_symbols if item["symbol"] != "XAUUSD"]
 
         if broker and not args.dry_run and last_deal_check is not None:
             closed_deals = broker.history_deals_since(last_deal_check, magic=26072026)
@@ -743,6 +1015,18 @@ def main():
                             )
                     except Exception:
                         pass
+
+        if DUAL_XAU_ENABLED and broker and not args.dry_run:
+            xau_symbol = resolve_live_symbol(broker, "XAUUSD", False)
+            if xau_symbol:
+                run_dual_xau_cycle(
+                    broker=broker,
+                    broker_symbol=xau_symbol,
+                    router=router,
+                    equity=float(broker.account_equity() or rules.initial_balance),
+                    max_positions=rules.max_open_positions,
+                    trade_states=trade_states,
+                )
 
         append_jsonl(
             run_log,
