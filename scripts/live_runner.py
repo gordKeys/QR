@@ -501,6 +501,7 @@ def main():
     parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
     parser.add_argument("--profit-lock-trigger-usd", type=float, default=1000.0)
     parser.add_argument("--profit-lock-usd", type=float, default=700.0)
+    parser.add_argument("--account-type", choices=[ACCOUNT_TYPE_STANDARD, "SWING"], default=ACCOUNT_TYPE_STANDARD)
     args = parser.parse_args()
 
     router = StrategyRouter()
