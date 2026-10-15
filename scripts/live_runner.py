@@ -20,25 +20,36 @@ from live_protection import HardDrawdownGuard, SymbolCircuitBreaker
 from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 from timing_utils import timed
 from ftmo_compliance import ACCOUNT_TYPE_STANDARD, FTMOComplianceConfig, FTMOComplianceEngine
+from xau_dual_runner import (
+    CURRENT_MAGIC,
+    TRAILING_MAGIC,
+    add_breakout_features,
+    calculate_volume as calculate_xau_volume,
+    manage_trailing,
+    trailing_plan,
+)
 
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.02,
+    "EURUSD": 0.015,
     "GBPUSD": 0.015,
     "XAUUSD": 0.01,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
-    "EURUSD": 4.8,
+    "EURUSD": 3.5,
 }
 SYMBOL_SL_ATR_BASE = {"EURUSD": 2.5, "GBPUSD": 2.0, "XAUUSD": 1.25}
-SYMBOL_TP_ATR_BASE = {"EURUSD": 4.8, "GBPUSD": 3.5, "XAUUSD": 1.75}
+SYMBOL_TP_ATR_BASE = {"EURUSD": 3.5, "GBPUSD": 3.5, "XAUUSD": 1.75}
 DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
 BREAK_EVEN_ENABLED = False
 EUR_GBP_RISK_CAP_PCT = 0.03
 DAILY_SOFT_STOP_PCT = 0.03
 HARD_LOSS_STOP_PCT = 0.038
 BLOCK_NEW_YORK_ENTRIES = True
+DUAL_XAU_ENABLED = True
+XAU_CURRENT_RISK = 0.005
+XAU_TRAILING_RISK = 0.005
 POSITION_GROUPS = {
     "EUR_GBP": {"EURUSD", "GBPUSD"},
 }
@@ -261,7 +272,100 @@ def format_status(symbol, consecutive_losses, cooldown_until, last_closed_pnl):
 
 
 def filter_owned_positions(positions):
+    return [
+        position for position in positions
+        if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+
+
+def filter_main_positions(positions):
     return [position for position in positions if getattr(position, "magic", None) == BOT_MAGIC]
+
+
+def load_xau_dual_data(broker, broker_symbol):
+    rates = broker.rates_copy(broker_symbol, broker.mt5.TIMEFRAME_M5, 3000)
+    if rates is None or len(rates) == 0:
+        return None
+    frame = pd.DataFrame(rates)
+    frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+    frame = frame.set_index("time").sort_index()
+    columns = ["open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
+    frame = frame[[column for column in columns if column in frame.columns]]
+    return add_breakout_features(FeatureEngine().add_features(frame))
+
+
+def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, trade_states):
+    data = load_xau_dual_data(broker, broker_symbol)
+    if data is None or data.empty:
+        print("XAUUSD dual: no data")
+        return
+    positions = [
+        position for position in broker.positions_get()
+        if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+    for position in positions:
+        if getattr(position, "magic", None) == TRAILING_MAGIC:
+            manage_trailing(broker, broker_symbol, data, position, trade_states)
+    xau_positions = [
+        position for position in positions
+        if getattr(position, "magic", None) in {CURRENT_MAGIC, TRAILING_MAGIC}
+    ]
+    tick = broker.symbol_tick(broker_symbol)
+    if tick is None or equity <= 0:
+        return
+    current_strategy = router.get_strategy("XAUUSD")
+    current_signal = int(current_strategy.generate_signals(data).iloc[-1])
+    trailing_signal, trailing_setup = trailing_plan(data)
+    candidates = [
+        ("current", current_signal, CURRENT_MAGIC, XAU_CURRENT_RISK),
+        ("trailing", trailing_signal, TRAILING_MAGIC, XAU_TRAILING_RISK),
+    ]
+    for name, signal, magic, risk_pct in candidates:
+        if not signal or len(positions) >= max_positions or any(
+            getattr(position, "magic", None) == magic for position in xau_positions
+        ):
+            continue
+        price = float(tick.ask if signal == 1 else tick.bid)
+        if name == "trailing":
+            if not trailing_setup:
+                continue
+            stop = float(trailing_setup["stop"])
+            target = float(trailing_setup["target"])
+            atr = float(trailing_setup["atr"])
+        else:
+            atr = float(data["atr"].iloc[-1])
+            regime = classify_regime(data)
+            score_components = {}
+            sl_atr, tp_atr = dynamic_atr_multipliers("XAUUSD", regime, score_components)
+            stop = price - atr * sl_atr if signal == 1 else price + atr * sl_atr
+            target = price + atr * tp_atr if signal == 1 else price - atr * tp_atr
+        stop, target = broker.conform_stop_levels(broker_symbol, signal, price, stop, target)
+        if stop is None or target is None:
+            print(f"XAUUSD {name}: invalid broker stop levels")
+            continue
+        volume = calculate_xau_volume(broker, broker_symbol, signal, price, stop, equity, risk_pct)
+        if volume <= 0:
+            print(f"XAUUSD {name}: insufficient margin or invalid volume")
+            continue
+        result = broker.place_order(
+            symbol=broker_symbol,
+            direction=signal,
+            volume=volume,
+            stop_loss=stop,
+            take_profit=target,
+            price=price,
+            comment=f"QuantFX-XAU-{name}",
+            magic=magic,
+        )
+        print(
+            f"XAUUSD {name}: signal={signal} risk={risk_pct:.2%} "
+            f"size={volume:.2f} sl={stop:.2f} tp={target:.2f} result={result}"
+        )
+        if result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE:
+            positions = [
+                position for position in broker.positions_get()
+                if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
+            ]
 
 
 def calculate_trade_volume(
@@ -459,8 +563,9 @@ def main():
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
     print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
     print(f"FTMO account type: {args.account_type}")
-    print("Portfolio limit: 2 positions (max 1 EURUSD/GBPUSD group + 1 other)")
-    print("Risk: EURUSD=2.00%, GBPUSD=1.50%, XAUUSD=1.00%")
+    print("Portfolio limit: 2 positions globally")
+    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.00% total (0.50% per XAU sleeve)")
+    print(f"Dual XAU runner: {'ON' if DUAL_XAU_ENABLED else 'OFF'} | magic={CURRENT_MAGIC}/{TRAILING_MAGIC}")
     print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
     print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
     print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
@@ -604,6 +709,8 @@ def main():
                             )
 
         live_symbols, symbol_aliases = build_live_symbol_context(args.symbols, broker, args.dry_run)
+        if DUAL_XAU_ENABLED:
+            live_symbols = [item for item in live_symbols if item["symbol"] != "XAUUSD"]
 
         if broker and not args.dry_run and last_deal_check is not None:
             closed_deals = broker.history_deals_since(last_deal_check, magic=26072026)
@@ -1205,6 +1312,18 @@ def main():
                             )
                     except Exception:
                         pass
+
+        if DUAL_XAU_ENABLED and broker and not args.dry_run:
+            xau_symbol = resolve_live_symbol(broker, "XAUUSD", False)
+            if xau_symbol:
+                run_dual_xau_cycle(
+                    broker=broker,
+                    broker_symbol=xau_symbol,
+                    router=router,
+                    equity=float(broker.account_equity() or rules.initial_balance),
+                    max_positions=rules.max_open_positions,
+                    trade_states=trade_states,
+                )
 
         append_jsonl(
             run_log,
