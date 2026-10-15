@@ -175,27 +175,25 @@ def position_side(position, broker):
     return 0
 
 
-def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
+def estimate_profit_lock_stop(position, broker, locked_profit_usd):
     info = broker.symbol_info(position.symbol)
-    tick = broker.symbol_tick(position.symbol)
-    if info is None or tick is None:
+    if info is None:
         return None
 
-    point = float(getattr(info, "point", 0.0) or 0.0)
     digits = int(getattr(info, "digits", 2) or 2)
-    contract_size = float(getattr(info, "trade_contract_size", 100000.0) or 100000.0)
-    spread = 0.0
-    if getattr(tick, "ask", None) is not None and getattr(tick, "bid", None) is not None:
-        spread = float(tick.ask - tick.bid)
+    tick_value = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    volume = float(getattr(position, "volume", 0.0) or 0.0)
+    if tick_value <= 0 or tick_size <= 0 or volume <= 0:
+        return None
 
-    commission_price = float(commission_round_turn_per_lot) / max(contract_size, 1.0)
-    safety_buffer = max(point * 2, spread * 0.1)
-    buffer = spread + commission_price + safety_buffer
+    value_per_price_unit = tick_value / tick_size
+    price_distance = float(locked_profit_usd) / (volume * value_per_price_unit)
     direction = position_side(position, broker)
     if direction == 1:
-        stop = float(getattr(position, "price_open", 0.0) or 0.0) + buffer
+        stop = float(getattr(position, "price_open", 0.0) or 0.0) + price_distance
     elif direction == -1:
-        stop = float(getattr(position, "price_open", 0.0) or 0.0) - buffer
+        stop = float(getattr(position, "price_open", 0.0) or 0.0) - price_distance
     else:
         return None
 
@@ -240,8 +238,8 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, default=3)
     parser.add_argument("--hard-drawdown-switch", action="store_true")
     parser.add_argument("--hard-drawdown-pct", type=float, default=10.0)
-    parser.add_argument("--break-even-trigger-pct", type=float, default=1.0)
-    parser.add_argument("--break-even-commission-round-turn", type=float, default=7.0)
+    parser.add_argument("--profit-lock-trigger-usd", type=float, default=1000.0)
+    parser.add_argument("--profit-lock-usd", type=float, default=700.0)
     args = parser.parse_args()
 
     router = StrategyRouter()
@@ -274,7 +272,11 @@ def main():
             f"gap_trades={args.revenge_gap_trades}"
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
-    print(f"Break-even trigger: {args.break_even_trigger_pct:.2f}%")
+    print(
+        "Profit lock: "
+        f"trigger=${args.profit_lock_trigger_usd:.2f} | "
+        f"locked=${args.profit_lock_usd:.2f}"
+    )
 
     broker = None
     if not args.dry_run:
@@ -478,24 +480,26 @@ def main():
                                 },
                             )
 
-                        break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
-                        if not state.get("break_even_moved") and current_profit >= break_even_trigger:
-                            break_even_sl = estimate_break_even_stop(
+                        if (
+                            not state.get("break_even_moved")
+                            and current_profit >= args.profit_lock_trigger_usd
+                        ):
+                            profit_lock_sl = estimate_profit_lock_stop(
                                 current_position,
                                 broker,
-                                args.break_even_commission_round_turn,
+                                args.profit_lock_usd,
                             )
-                            if break_even_sl is not None:
+                            if profit_lock_sl is not None:
                                 result = broker.modify_position_stops(
                                     position_ticket=getattr(current_position, "ticket", None),
                                     symbol=symbol,
-                                    stop_loss=break_even_sl,
+                                    stop_loss=profit_lock_sl,
                                     take_profit=getattr(current_position, "tp", None),
                                 )
                                 accepted = result is not None and getattr(result, "retcode", None) == broker.mt5.TRADE_RETCODE_DONE
                                 if accepted:
                                     state["break_even_moved"] = True
-                                    state["break_even_sl"] = break_even_sl
+                                    state["break_even_sl"] = profit_lock_sl
                                     append_jsonl(
                                         run_log,
                                         {
@@ -503,9 +507,9 @@ def main():
                                             "symbol": symbol,
                                             "ticket": getattr(current_position, "ticket", None),
                                             "profit_usd": current_profit,
-                                            "break_even_trigger_usd": break_even_trigger,
-                                            "break_even_trigger_pct": args.break_even_trigger_pct,
-                                            "new_stop": break_even_sl,
+                                            "profit_lock_trigger_usd": args.profit_lock_trigger_usd,
+                                            "profit_lock_usd": args.profit_lock_usd,
+                                            "new_stop": profit_lock_sl,
                                             "mfe_usd": state["mfe_usd"],
                                             "time": started,
                                         },
