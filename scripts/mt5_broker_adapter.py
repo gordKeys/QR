@@ -129,18 +129,27 @@ class MT5BrokerAdapter:
             return 0.0
 
         stops_level = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
+        freeze_level = float(getattr(info, "trade_freeze_level", 0.0) or 0.0)
         point = float(getattr(info, "point", 0.0) or 0.0)
-        return stops_level * point
+        if point <= 0:
+            return 0.0
+        effective_level = max(stops_level, freeze_level)
+        return (effective_level + 1.0) * point
 
     def conform_stop_levels(self, symbol, direction, entry_price, stop_loss, take_profit):
         min_distance = self.min_stop_distance(symbol)
+        tick = self.symbol_tick(symbol)
+        if tick is not None:
+            market_price = float(tick.bid if direction == 1 else tick.ask)
+        else:
+            market_price = float(entry_price)
         if min_distance > 0:
             if direction == 1:
-                stop_loss = min(stop_loss, entry_price - min_distance)
-                take_profit = max(take_profit, entry_price + min_distance)
+                stop_loss = min(stop_loss, market_price - min_distance)
+                take_profit = max(take_profit, market_price + min_distance)
             else:
-                stop_loss = max(stop_loss, entry_price + min_distance)
-                take_profit = min(take_profit, entry_price - min_distance)
+                stop_loss = max(stop_loss, market_price + min_distance)
+                take_profit = min(take_profit, market_price - min_distance)
 
         stop_loss = self.normalize_price(symbol, stop_loss)
         take_profit = self.normalize_price(symbol, take_profit)
