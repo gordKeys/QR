@@ -887,6 +887,24 @@ def main():
                     target = float(strategy_plan.get("target"))
                     size = float(strategy_plan.get("size")) * revenge_context["multiplier"]
                     size_reason = strategy_plan.get("size_reason", "strategy_plan")
+                    if broker and not args.dry_run:
+                        stop, target = broker.conform_stop_levels(
+                            broker_symbol, signal, price, stop, target
+                        )
+                        if stop is None or target is None:
+                            print(f"{symbol}: skipped because broker stop levels are invalid")
+                            cycle_counts["skip_invalid_stops"] += 1
+                            append_jsonl(
+                                run_log,
+                                {
+                                    "event": "skip_invalid_stops",
+                                    "symbol": symbol,
+                                    "signal": signal,
+                                    "price": price,
+                                    "broker_time": broker_time,
+                                },
+                            )
+                            continue
                 else:
                     stop, target = risk.calculate_sl_tp(signal, price, atr)
 
