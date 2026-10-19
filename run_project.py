@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--revenge-boosts", type=int, help="Live mode only")
     parser.add_argument("--hard-drawdown-switch", action="store_true", help="Live mode only")
     parser.add_argument("--hard-drawdown-usd", type=float, help="Live mode only")
+    parser.add_argument("--disable-m30-filter", action="store_true", help="Disable the M30 opposing-trend veto in live mode")
     parser.add_argument(
         "--mt5-path",
         default=r"C:\Program Files\MetaTrader 5\terminal64.exe",
@@ -132,6 +133,8 @@ def main():
             live_args.append("--hard-drawdown-switch")
         if args.hard_drawdown_usd is not None:
             live_args.extend(["--hard-drawdown-usd", str(args.hard_drawdown_usd)])
+        if args.disable_m30_filter:
+            live_args.append("--disable-m30-filter")
         if args.mt5_path:
             live_args.extend(["--mt5-path", args.mt5_path])
         if not live_args:

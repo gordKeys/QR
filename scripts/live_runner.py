@@ -164,14 +164,23 @@ def entry_context(data, regime, signal, spread_points):
     return session_name(timestamp), components
 
 
-def entry_quality_block(symbol, data, regime, signal, score, score_components, spread_points):
+def entry_quality_block(
+    symbol,
+    data,
+    regime,
+    signal,
+    score,
+    score_components,
+    spread_points,
+    m30_filter_enabled=True,
+):
     if symbol in {"EURUSD", "GBPUSD"}:
         session, context = entry_context(data, regime, signal, spread_points)
         if session != "Asia":
             return "asia_only_session", session, context
         if regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging":
             return "m15_regime_not_ranging", session, context
-        if regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
+        if m30_filter_enabled and regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
             return "m30_opposes_reversion", session, context
         if context["candle_body_ratio"] < 0.20 or context["candle_body_ratio"] > 0.90:
             return "poor_candle_quality", session, context
@@ -524,6 +533,7 @@ def main():
     parser.add_argument("--max-spread-points", type=float, default=30.0)
     parser.add_argument("--max-candle-atr", type=float, default=2.5)
     parser.add_argument("--max-atr-ratio", type=float, default=3.0)
+    parser.add_argument("--disable-m30-filter", action="store_true")
     parser.add_argument("--mt5-path", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe")
     args = parser.parse_args()
 
@@ -570,6 +580,7 @@ def main():
     print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
     print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
     print(f"New York entries: {'BLOCKED' if BLOCK_NEW_YORK_ENTRIES else 'ALLOWED'}")
+    print(f"M30 opposing-trend filter: {'OFF' if args.disable_m30_filter else 'ON'}")
 
     broker = None
     if not args.dry_run:
@@ -1015,7 +1026,14 @@ def main():
                         continue
 
                 quality_reason, session, market_context = entry_quality_block(
-                    symbol, data, regime, signal, signal_score, score_components, spread_points
+                    symbol,
+                    data,
+                    regime,
+                    signal,
+                    signal_score,
+                    score_components,
+                    spread_points,
+                    m30_filter_enabled=not args.disable_m30_filter,
                 )
                 if BLOCK_NEW_YORK_ENTRIES and session == "NewYork":
                     quality_reason = "new_york_blocked"
