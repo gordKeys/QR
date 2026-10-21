@@ -156,6 +156,55 @@ class FTMOXAUUSD(BaseStrategy):
 
         return signals
 
+
+class GuardedFTMOXAUUSD(FTMOXAUUSD):
+    """High-quality current XAU sleeve with regime and candle guards."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["min_score"] = max(int(kwargs.get("min_score", 3)), 3)
+        super().__init__(*args, **kwargs)
+
+    def generate_signals(self, data: pd.DataFrame):
+        signals = super().generate_signals(data).copy()
+        prefixes = {
+            "15min": "15min_" if "15min_adx" in data.columns else "m15_",
+            "30min": "30min_" if "30min_adx" in data.columns else "m30_",
+        }
+        required = tuple(
+            f"{prefixes[timeframe]}{name}"
+            for timeframe in prefixes
+            for name in ("adx", "atr_ratio", "ema_slope")
+        )
+        if any(column not in data.columns for column in required):
+            return signals * 0
+        for index in range(len(data)):
+            if not signals.iloc[index]:
+                continue
+            row = data.iloc[index]
+            close = float(row["close"])
+            if close <= 0:
+                signals.iloc[index] = 0
+                continue
+            if not (
+                float(row[f"{prefixes['15min']}adx"]) <= 25.0
+                and float(row[f"{prefixes['30min']}adx"]) <= 25.0
+                and 0.75 <= float(row[f"{prefixes['15min']}atr_ratio"]) <= 1.50
+                and 0.75 <= float(row[f"{prefixes['30min']}atr_ratio"]) <= 1.50
+                and max(
+                    abs(float(row[f"{prefixes['15min']}ema_slope"])),
+                    abs(float(row[f"{prefixes['30min']}ema_slope"])),
+                ) <= float(row["atr"]) * 0.45
+            ):
+                signals.iloc[index] = 0
+                continue
+            recent = data.iloc[max(0, index - 3):index + 1]
+            if len(recent) >= 4 and (
+                (recent["close"] > recent["open"]).all()
+                or (recent["close"] < recent["open"]).all()
+            ):
+                signals.iloc[index] = 0
+        return signals
+
     def analyze_trade(self, data: pd.DataFrame, *, broker=None, symbol=None, equity=0.0, signal=None, price=None):
         if signal == 0:
             return None

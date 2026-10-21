@@ -109,7 +109,17 @@ class ResearchBroker:
         self.symbol, self.price = symbol, float(price)
 
     def symbol_info(self, symbol):
-        return self.specs[symbol]
+        info = self.specs[symbol]
+        aliases = {
+            "trade_tick_size": "tick_size",
+            "trade_tick_value": "tick_value",
+            "trade_contract_size": "contract_size",
+            "trade_stops_level": "stops_level",
+        }
+        for mt5_name, research_name in aliases.items():
+            if not hasattr(info, mt5_name):
+                setattr(info, mt5_name, getattr(info, research_name, 0.0))
+        return info
 
     def symbol_tick(self, symbol):
         info = self.specs[symbol]

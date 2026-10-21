@@ -32,9 +32,9 @@ from xau_dual_runner import (
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.015,
-    "GBPUSD": 0.015,
-    "XAUUSD": 0.01,
+    "EURUSD": 0.005,
+    "GBPUSD": 0.005,
+    "XAUUSD": 0.005,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
     "EURUSD": 3.5,
@@ -48,6 +48,7 @@ DAILY_SOFT_STOP_PCT = 0.03
 HARD_LOSS_STOP_PCT = 0.038
 BLOCK_NEW_YORK_ENTRIES = True
 DUAL_XAU_ENABLED = True
+XAU_TRAILING_ENABLED = False
 XAU_CURRENT_RISK = 0.005
 XAU_TRAILING_RISK = 0.005
 POSITION_GROUPS = {
@@ -176,8 +177,10 @@ def entry_quality_block(
 ):
     if symbol in {"EURUSD", "GBPUSD"}:
         session, context = entry_context(data, regime, signal, spread_points)
-        if session != "Asia":
-            return "asia_only_session", session, context
+        if symbol == "EURUSD" and session == "NewYork":
+            return "new_york_session_blocked", session, context
+        if symbol == "GBPUSD" and session != "Asia":
+            return "gbpusd_session_blocked", session, context
         if regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging":
             return "m15_regime_not_ranging", session, context
         if m30_filter_enabled and regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
@@ -313,7 +316,7 @@ def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, tra
         if getattr(position, "magic", None) in {BOT_MAGIC, CURRENT_MAGIC, TRAILING_MAGIC}
     ]
     for position in positions:
-        if getattr(position, "magic", None) == TRAILING_MAGIC:
+        if XAU_TRAILING_ENABLED and getattr(position, "magic", None) == TRAILING_MAGIC:
             manage_trailing(broker, broker_symbol, data, position, trade_states)
     xau_positions = [
         position for position in positions
@@ -324,11 +327,12 @@ def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, tra
         return
     current_strategy = router.get_strategy("XAUUSD")
     current_signal = int(current_strategy.generate_signals(data).iloc[-1])
-    trailing_signal, trailing_setup = trailing_plan(data)
     candidates = [
         ("current", current_signal, CURRENT_MAGIC, XAU_CURRENT_RISK),
-        ("trailing", trailing_signal, TRAILING_MAGIC, XAU_TRAILING_RISK),
     ]
+    if XAU_TRAILING_ENABLED:
+        trailing_signal, trailing_setup = trailing_plan(data)
+        candidates.append(("trailing", trailing_signal, TRAILING_MAGIC, XAU_TRAILING_RISK))
     for name, signal, magic, risk_pct in candidates:
         if not signal or len(positions) >= max_positions or any(
             getattr(position, "magic", None) == magic for position in xau_positions
@@ -533,7 +537,8 @@ def main():
     parser.add_argument("--max-spread-points", type=float, default=30.0)
     parser.add_argument("--max-candle-atr", type=float, default=2.5)
     parser.add_argument("--max-atr-ratio", type=float, default=3.0)
-    parser.add_argument("--disable-m30-filter", action="store_true")
+    parser.add_argument("--enable-m30-filter", action="store_true")
+    parser.add_argument("--disable-m30-filter", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mt5-path", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe")
     args = parser.parse_args()
 
@@ -574,13 +579,15 @@ def main():
     print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
     print(f"FTMO account type: {args.account_type}")
     print("Portfolio limit: 2 positions globally")
-    print("Risk: EURUSD=1.50%, GBPUSD=1.50%, XAUUSD=1.00% total (0.50% per XAU sleeve)")
-    print(f"Dual XAU runner: {'ON' if DUAL_XAU_ENABLED else 'OFF'} | magic={CURRENT_MAGIC}/{TRAILING_MAGIC}")
+    print("Risk: EURUSD=0.50%, GBPUSD=0.50%, XAUUSD=0.50% current sleeve")
+    print(f"Dual XAU runner: {'ON' if DUAL_XAU_ENABLED else 'OFF'} | current magic={CURRENT_MAGIC}")
+    print(f"XAU trailing breakout: {'ON' if XAU_TRAILING_ENABLED else 'OFF'}")
     print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
     print(f"Daily soft stop: {DAILY_SOFT_STOP_PCT * 100:.2f}%")
     print(f"Hard loss stop: {HARD_LOSS_STOP_PCT * 100:.2f}% when no positive MFE")
     print(f"New York entries: {'BLOCKED' if BLOCK_NEW_YORK_ENTRIES else 'ALLOWED'}")
-    print(f"M30 opposing-trend filter: {'OFF' if args.disable_m30_filter else 'ON'}")
+    m30_filter_enabled = args.enable_m30_filter and not args.disable_m30_filter
+    print(f"M30 opposing-trend filter: {'ON' if m30_filter_enabled else 'OFF'}")
 
     broker = None
     if not args.dry_run:
@@ -1033,7 +1040,7 @@ def main():
                     signal_score,
                     score_components,
                     spread_points,
-                    m30_filter_enabled=not args.disable_m30_filter,
+                    m30_filter_enabled=m30_filter_enabled,
                 )
                 if BLOCK_NEW_YORK_ENTRIES and session == "NewYork":
                     quality_reason = "new_york_blocked"

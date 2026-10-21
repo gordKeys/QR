@@ -1,6 +1,6 @@
 from strategies.mean_reversion import MeanReversion
 from strategies.momentum import Momentum
-from strategies.ftmo_xauusd import FTMOXAUUSD
+from strategies.ftmo_xauusd import GuardedFTMOXAUUSD
 from strategies.trend_follow import TrendFollowing
 from strategies.volatility_breakout import VolatilityBreakout
 
@@ -34,7 +34,7 @@ class StrategyRouter:
             "momentum": Momentum(),
             "trend": TrendFollowing(),
             "volatility_breakout": VolatilityBreakout(),
-            "ftmo_xauusd": FTMOXAUUSD(
+            "ftmo_xauusd": GuardedFTMOXAUUSD(
                 min_score=1 if very_relaxed else (3 if relaxed else 4),
                 min_atr_points=0 if very_relaxed else 5,
                 forex_hours=range(24) if very_relaxed else range(8, 22),
