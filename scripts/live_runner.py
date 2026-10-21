@@ -42,7 +42,9 @@ SYMBOL_TP_ATR_OVERRIDES = {
 SYMBOL_SL_ATR_BASE = {"EURUSD": 2.5, "GBPUSD": 2.0, "XAUUSD": 1.25}
 SYMBOL_TP_ATR_BASE = {"EURUSD": 3.5, "GBPUSD": 3.5, "XAUUSD": 1.75}
 DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
-BREAK_EVEN_ENABLED = False
+BREAK_EVEN_ENABLED = True
+BREAK_EVEN_SYMBOL = "GBPUSD"
+BREAK_EVEN_TP_FRACTION = 0.50
 EUR_GBP_RISK_CAP_PCT = 0.03
 DAILY_SOFT_STOP_PCT = 0.03
 HARD_LOSS_STOP_PCT = 0.038
@@ -481,6 +483,20 @@ def estimate_break_even_stop(position, broker, commission_round_turn_per_lot):
     return round(stop, digits)
 
 
+def tp_progress_reached(position, broker, fraction):
+    entry = float(getattr(position, "price_open", 0.0) or 0.0)
+    target = float(getattr(position, "tp", 0.0) or 0.0)
+    if entry <= 0 or target <= 0 or not 0 < fraction <= 1:
+        return False
+    tick = broker.symbol_tick(position.symbol)
+    if tick is None:
+        return False
+    direction = position_side(position, broker)
+    current = float(getattr(tick, "bid", 0.0) or 0.0) if direction == 1 else float(getattr(tick, "ask", 0.0) or 0.0)
+    trigger = entry + (target - entry) * fraction
+    return current >= trigger if direction == 1 else current <= trigger
+
+
 def ensure_trade_state(trade_states, position, state_key=None):
     key = state_key or position.symbol
     state = trade_states.get(key)
@@ -576,7 +592,10 @@ def main():
             f"gap_trades={args.revenge_gap_trades}"
         )
     print(f"Hard drawdown switch: {'ON' if args.hard_drawdown_switch else 'OFF'} | threshold={args.hard_drawdown_pct:.2f}%")
-    print(f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}")
+    print(
+        f"Break-even: {'ON' if BREAK_EVEN_ENABLED else 'OFF'}"
+        f" | {BREAK_EVEN_SYMBOL} at {BREAK_EVEN_TP_FRACTION:.0%} of TP"
+    )
     print(f"FTMO account type: {args.account_type}")
     print("Portfolio limit: 2 positions globally")
     print("Risk: EURUSD=0.50%, GBPUSD=0.50%, XAUUSD=0.50% current sleeve")
@@ -868,7 +887,12 @@ def main():
                             )
 
                         break_even_trigger = reference_balance * (args.break_even_trigger_pct / 100.0)
-                        if BREAK_EVEN_ENABLED and not state.get("break_even_moved") and current_profit >= break_even_trigger:
+                        if (
+                            BREAK_EVEN_ENABLED
+                            and symbol == BREAK_EVEN_SYMBOL
+                            and not state.get("break_even_moved")
+                            and tp_progress_reached(current_position, broker, BREAK_EVEN_TP_FRACTION)
+                        ):
                             break_even_sl = estimate_break_even_stop(
                                 current_position,
                                 broker,
@@ -892,7 +916,7 @@ def main():
                                             "symbol": symbol,
                                             "ticket": getattr(current_position, "ticket", None),
                                             "profit_usd": current_profit,
-                                            "break_even_trigger_usd": break_even_trigger,
+                                            "break_even_trigger_fraction": BREAK_EVEN_TP_FRACTION,
                                             "break_even_trigger_pct": args.break_even_trigger_pct,
                                             "new_stop": break_even_sl,
                                             "mfe_usd": state["mfe_usd"],
