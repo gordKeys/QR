@@ -32,9 +32,9 @@ from xau_dual_runner import (
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.005,
-    "GBPUSD": 0.005,
-    "XAUUSD": 0.005,
+    "EURUSD": 0.01,
+    "GBPUSD": 0.01,
+    "XAUUSD": 0.01,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
     "EURUSD": 3.5,
