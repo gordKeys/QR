@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +70,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    started = time.perf_counter()
+    print(
+        f"[standardized] starting branch={args.branch} "
+        f"commits={len(args.commits) if args.commits else args.previous_count + 1} "
+        f"symbols={','.join(args.symbols)}",
+        flush=True,
+    )
     data_dir = Path(args.data_dir).resolve()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -77,6 +85,7 @@ def main() -> None:
     if args.download_mt5:
         downloader = ROOT / "scripts" / "download_mt5_history.py"
         for timeframe in ("M1", "M5"):
+            print(f"[standardized] downloading {timeframe} history...", flush=True)
             download_args = [
                 sys.executable, str(downloader), "--symbols", *symbols,
                 "--timeframe", timeframe, "--output-dir", str(data_dir),
@@ -88,6 +97,7 @@ def main() -> None:
             if args.to_date:
                 download_args += ["--to-date", args.to_date]
             subprocess.run(download_args, cwd=ROOT, check=True)
+            print(f"[standardized] {timeframe} download complete", flush=True)
     data_files = {}
     for symbol in symbols:
         data_files[symbol] = {}
@@ -97,6 +107,10 @@ def main() -> None:
                 raise FileNotFoundError(f"Missing frozen {timeframe} data for {symbol}: {data_dir}")
             data_files[symbol][timeframe] = {"path": str(matches[0]), "sha256": sha256(matches[0]), "bytes": matches[0].stat().st_size}
     commits = args.commits or commit_list(args.branch, args.previous_count + 1)
+    print(
+        f"[standardized] frozen snapshot ready; testing {len(commits)} commit(s)",
+        flush=True,
+    )
     manifest = {
         "runner": "standardized_backtest",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -129,11 +143,17 @@ def main() -> None:
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     results = []
-    for commit in commits:
+    for commit_number, commit in enumerate(commits, start=1):
         short = commit[:12]
         commit_output = output / short
         worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
         try:
+            commit_started = time.perf_counter()
+            print(
+                f"[standardized] commit {commit_number}/{len(commits)} "
+                f"{short}: starting worker",
+                flush=True,
+            )
             command("git", "worktree", "add", "--detach", str(worktree), commit)
             worker_copy = worktree / "scripts" / WORKER.name
             shutil.copy2(WORKER, worker_copy)
@@ -157,18 +177,49 @@ def main() -> None:
                 worker_args.append("--diagnostic")
             env = os.environ.copy()
             env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
-            result = subprocess.run(worker_args, cwd=worktree, env=env, text=True, capture_output=True)
-            item = {"commit": commit, "status": "passed" if result.returncode == 0 else "failed", "output": str(commit_output)}
-            if result.returncode:
-                item["error"] = result.stderr[-4000:]
+            process = subprocess.Popen(
+                worker_args,
+                cwd=worktree,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+            worker_output = []
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.rstrip()
+                worker_output.append(line)
+                print(f"[worker {short}] {line}", flush=True)
+            result_code = process.wait()
+            item = {"commit": commit, "status": "passed" if result_code == 0 else "failed", "output": str(commit_output)}
+            if result_code:
+                item["error"] = "\n".join(worker_output)[-4000:]
             else:
                 item["report"] = json.loads((commit_output / "report.json").read_text(encoding="utf-8"))
             results.append(item)
+            print(
+                f"[standardized] commit {commit_number}/{len(commits)} {short}: "
+                f"{item['status']} ({time.perf_counter() - commit_started:.1f}s)",
+                flush=True,
+            )
         finally:
             command("git", "worktree", "remove", "--force", str(worktree), check=False)
             shutil.rmtree(worktree, ignore_errors=True)
     (output / "results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
-    print(json.dumps({"manifest": str(output / "manifest.json"), "results": str(output / "results.json"), "commits": len(results)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "manifest": str(output / "manifest.json"),
+                "results": str(output / "results.json"),
+                "commits": len(results),
+                "elapsed_seconds": round(time.perf_counter() - started, 1),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

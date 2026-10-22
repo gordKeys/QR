@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -60,6 +61,7 @@ def run(frames, specs, news, initial, config, execution_frames, start=None, end=
 
 def main() -> None:
     args = parse_args()
+    started = time.perf_counter()
     symbols = [symbol.upper() for symbol in args.symbols]
     risk = json.loads(args.risk_json)
     backtest.SYMBOLS = symbols
@@ -71,7 +73,17 @@ def main() -> None:
     data_dir = Path(args.data_dir).resolve()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    print(
+        f"starting worker; symbols={','.join(symbols)}; "
+        f"walk-forward windows requested={args.walkforward_windows}",
+        flush=True,
+    )
     frames, specs, names = backtest.load_cached(symbols, data_dir)
+    print(
+        "loaded M5 data: "
+        + ", ".join(f"{symbol}={len(frames[symbol])} bars" for symbol in symbols),
+        flush=True,
+    )
     execution_frames = {}
     for symbol in symbols:
         paths = sorted(data_dir.glob(f"*{symbol}*_M1.csv"))
@@ -80,6 +92,11 @@ def main() -> None:
         frame = pd.read_csv(paths[0])
         frame["time"] = pd.to_datetime(frame["time"], utc=True)
         execution_frames[symbol] = frame.set_index("time").sort_index()
+    print(
+        "loaded M1 execution data: "
+        + ", ".join(f"{symbol}={len(execution_frames[symbol])} bars" for symbol in symbols),
+        flush=True,
+    )
     news = pd.DataFrame(columns=["time", "currency", "title"])
     config = backtest.ExperimentConfig(
         "standardized_live_profile",
@@ -93,7 +110,14 @@ def main() -> None:
         daily_soft_stop_pct=0.03,
     )
 
+    print("full-sample backtest started", flush=True)
+    full_started = time.perf_counter()
     trades, equity = run(frames, specs, news, args.initial_balance, config, execution_frames)
+    print(
+        f"full-sample backtest complete: trades={len(trades)} "
+        f"elapsed={time.perf_counter() - full_started:.1f}s",
+        flush=True,
+    )
     trades.to_csv(output / "trades_full.csv", index=False)
     equity.to_csv(output / "equity_full.csv", index=False)
     report = {
@@ -116,7 +140,18 @@ def main() -> None:
     for window_number in range(args.walkforward_windows):
         window_end = cursor + pd.Timedelta(days=args.walkforward_window_days)
         if window_end > end:
+            print(
+                f"walk-forward window {window_number + 1}: skipped; "
+                f"{cursor} to {window_end} exceeds data end {end}",
+                flush=True,
+            )
             break
+        window_started = time.perf_counter()
+        print(
+            f"walk-forward window {window_number + 1}/{args.walkforward_windows} "
+            f"started: {cursor} to {window_end}",
+            flush=True,
+        )
         window_trades, window_equity = run(
             frames,
             specs,
@@ -141,12 +176,22 @@ def main() -> None:
                 ),
             }
         )
+        print(
+            f"walk-forward window {window_number + 1}/{args.walkforward_windows} "
+            f"complete: trades={len(window_trades)} "
+            f"elapsed={time.perf_counter() - window_started:.1f}s",
+            flush=True,
+        )
         cursor += pd.Timedelta(days=args.walkforward_step_days)
 
     (output / "report.json").write_text(
         json.dumps(report, indent=2, default=str), encoding="utf-8"
     )
-    print(json.dumps(report, indent=2, default=str))
+    print(
+        f"worker complete: report={output / 'report.json'} "
+        f"elapsed={time.perf_counter() - started:.1f}s",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
