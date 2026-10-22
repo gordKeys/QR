@@ -412,8 +412,15 @@ def build_plan(symbol, frame, index, signal, score, components, equity, broker, 
 
 def execution_exit(position, m5_bar, m1_bars):
     """Use sequential M1 candles to resolve exits inside an M5 bar."""
-    bars = m1_bars if m1_bars is not None and not m1_bars.empty else [m5_bar]
-    for bar in bars if not isinstance(bars, list) else bars:
+    if m1_bars is None:
+        bars = [m5_bar]
+    elif isinstance(m1_bars, list):
+        bars = m1_bars or [m5_bar]
+    elif getattr(m1_bars, "empty", False):
+        bars = [m5_bar]
+    else:
+        bars = m1_bars
+    for bar in bars:
         if position.direction == 1:
             stop_hit, target_hit = bar.low <= position.stop, bar.high >= position.target
         else:
