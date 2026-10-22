@@ -1,8 +1,9 @@
 """Run identical research tests across a branch and its recent commits.
 
 The runner freezes the selected Git commits, data hashes, date range, costs,
-risk, position limits, and walk-forward schedule in manifest.json. It never
-downloads data and never changes the caller's checkout.
+risk, position limits, and walk-forward schedule in manifest.json. It can
+download one frozen M1/M5 snapshot from MT5 and never changes the caller's
+checkout.
 """
 
 from __future__ import annotations
@@ -48,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commits", nargs="+", help="Exact commits; overrides --branch")
     parser.add_argument("--previous-count", type=int, default=10)
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--download-mt5", action="store_true")
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--from-date")
+    parser.add_argument("--to-date")
     parser.add_argument("--output", required=True)
     parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "XAUUSD"])
     parser.add_argument("--initial-balance", type=float, default=100000.0)
@@ -69,12 +74,28 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     symbols = [symbol.upper() for symbol in args.symbols]
     risk = json.loads(args.risk)
+    if args.download_mt5:
+        downloader = ROOT / "scripts" / "download_mt5_history.py"
+        for timeframe in ("M1", "M5"):
+            download_args = [
+                sys.executable, str(downloader), "--symbols", *symbols,
+                "--timeframe", timeframe, "--output-dir", str(data_dir),
+            ]
+            if args.from_date:
+                download_args += ["--from-date", args.from_date]
+            else:
+                download_args += ["--days", str(args.days)]
+            if args.to_date:
+                download_args += ["--to-date", args.to_date]
+            subprocess.run(download_args, cwd=ROOT, check=True)
     data_files = {}
     for symbol in symbols:
-        matches = sorted(data_dir.glob(f"*{symbol}*_M5.csv"))
-        if not matches:
-            raise FileNotFoundError(f"Missing frozen M5 data for {symbol}: {data_dir}")
-        data_files[symbol] = {"path": str(matches[0]), "sha256": sha256(matches[0]), "bytes": matches[0].stat().st_size}
+        data_files[symbol] = {}
+        for timeframe in ("M1", "M5"):
+            matches = sorted(data_dir.glob(f"*{symbol}*_{timeframe}.csv"))
+            if not matches:
+                raise FileNotFoundError(f"Missing frozen {timeframe} data for {symbol}: {data_dir}")
+            data_files[symbol][timeframe] = {"path": str(matches[0]), "sha256": sha256(matches[0]), "bytes": matches[0].stat().st_size}
     commits = args.commits or commit_list(args.branch, args.previous_count + 1)
     manifest = {
         "runner": "standardized_backtest",
@@ -99,7 +120,8 @@ def main() -> None:
         },
         "diagnostic_mode": args.diagnostic,
         "notes": [
-            "Data is never downloaded by this runner.",
+            "M5 generates signals; sequential M1 candles resolve intrabar exits.",
+            "Data is downloaded only once when --download-mt5 is supplied.",
             "Every commit receives the same snapshot and command parameters.",
             "A failed or incompatible historical commit is recorded, not silently substituted.",
         ],
@@ -115,6 +137,7 @@ def main() -> None:
             command("git", "worktree", "add", "--detach", str(worktree), commit)
             worker_copy = worktree / "scripts" / WORKER.name
             shutil.copy2(WORKER, worker_copy)
+            shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
             worker_args = [
                 sys.executable,
                 str(worker_copy),

@@ -12,6 +12,7 @@ from mt5_broker_adapter import MT5BrokerAdapter, MT5UnavailableError
 
 
 TIMEFRAME_MAP = {
+    "M1": "TIMEFRAME_M1",
     "M5": "TIMEFRAME_M5",
     "M15": "TIMEFRAME_M15",
     "H1": "TIMEFRAME_H1",

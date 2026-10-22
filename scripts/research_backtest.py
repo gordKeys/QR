@@ -410,7 +410,24 @@ def build_plan(symbol, frame, index, signal, score, components, equity, broker, 
     return Position(symbol, signal, frame.index[index], float(plan["price"]), float(plan["stop"]), float(plan["target"]), volume, risk, score, components, strategy.__class__.__name__, regime_label(frame, index), news_context, index, commission(volume), info.spread_price * volume * info.tick_value / info.tick_size)
 
 
-def simulate(frames, specs, news, initial_balance, slippage_points, config=None, candidate_rows=None):
+def execution_exit(position, m5_bar, m1_bars):
+    """Use sequential M1 candles to resolve exits inside an M5 bar."""
+    bars = m1_bars if m1_bars is not None and not m1_bars.empty else [m5_bar]
+    for bar in bars if not isinstance(bars, list) else bars:
+        if position.direction == 1:
+            stop_hit, target_hit = bar.low <= position.stop, bar.high >= position.target
+        else:
+            stop_hit, target_hit = bar.high >= position.stop, bar.low <= position.target
+        if stop_hit and target_hit:
+            return "SL_and_TP_same_bar_conservative_SL", position.stop
+        if stop_hit:
+            return "SL", position.stop
+        if target_hit:
+            return "TP", position.target
+    return None, None
+
+
+def simulate(frames, specs, news, initial_balance, slippage_points, config=None, candidate_rows=None, execution_frames=None):
     config = config or EXPERIMENTS["baseline"]
     candidate_rows = candidate_rows if candidate_rows is not None else []
     router = StrategyRouter()
@@ -422,6 +439,7 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
     daily_base, current_day = initial_balance, None
     daily_blocked = False
     total_blocked = False
+    previous_timestamp = None
     for timestamp in timeline:
         prague_day = timestamp.tz_convert("Europe/Prague").date()
         if prague_day != current_day:
@@ -435,16 +453,15 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             position.mfe_usd = max(position.mfe_usd, floating)
             position.mae_usd = min(position.mae_usd, floating)
             reason, exit_price = None, None
-            if position.direction == 1:
-                stop_hit, target_hit = bar.low <= position.stop, bar.high >= position.target
-            else:
-                stop_hit, target_hit = bar.high >= position.stop, bar.low <= position.target
-            if stop_hit and target_hit:
-                reason, exit_price = "SL_and_TP_same_bar_conservative_SL", position.stop
-            elif stop_hit:
-                reason, exit_price = "SL", position.stop
-            elif target_hit:
-                reason, exit_price = "TP", position.target
+            m1_bars = None
+            if execution_frames is not None and symbol in execution_frames:
+                start = previous_timestamp or timestamp - pd.Timedelta(minutes=5)
+                m1_bars = execution_frames[symbol].loc[
+                    (execution_frames[symbol].index >= start)
+                    & (execution_frames[symbol].index < timestamp)
+                ].itertuples(index=False)
+                m1_bars = list(m1_bars)
+            reason, exit_price = execution_exit(position, bar, m1_bars)
             current_index = frames[symbol].index.get_loc(timestamp)
             if config.exit_management and reason is None:
                 current_signal = int(signals[symbol].iloc[current_index])
@@ -567,6 +584,7 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                     plan.entry_spread = spec.spread_price * plan.volume * spec.tick_value / spec.tick_size
                     positions[symbol] = plan
                 del pending[symbol]
+        previous_timestamp = timestamp
     trades_frame = pd.DataFrame(trades)
     if not trades_frame.empty:
         trades_frame["stopped_before_later_tp"] = trades_frame.apply(lambda row: later_target_reached(row.to_dict(), frames), axis=1)
