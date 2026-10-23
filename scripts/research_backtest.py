@@ -57,6 +57,8 @@ class ExperimentConfig:
     daily_soft_stop_pct: float | None = None
     block_new_york_symbols: tuple[str, ...] = ()
     new_york_tp_atr: float | None = None
+    allowed_sessions_by_symbol: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    session_tp_atr_overrides: tuple[tuple[str, str, float], ...] = ()
     continue_after_ftmo_breach: bool = False
     regime_symbols: tuple[str, ...] = ()
     m30_symbols: tuple[str, ...] = ()
@@ -569,8 +571,12 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             if np.isfinite(atr_value) and atr_value > 0:
                 spread_atr_ratio = float(frame.spread.iloc[index]) * specs[symbol].point / atr_value
             rejection = None
+            current_session = session_name(timestamp)
+            allowed_sessions = dict(config.allowed_sessions_by_symbol)
             if news_block:
                 rejection = "news_blackout"
+            elif symbol in allowed_sessions and current_session not in allowed_sessions[symbol]:
+                rejection = "session_filter"
             elif symbol in config.block_new_york_symbols and session_is_new_york(timestamp):
                 rejection = "new_york_blocked"
             elif config.session_guard and not session_allows(symbol, int(score or 0), timestamp):
@@ -588,6 +594,13 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                 atr = float(frame.atr.iloc[index])
                 if np.isfinite(atr) and atr > 0:
                     plan.target = plan.entry + signal * config.new_york_tp_atr * atr
+            if plan is not None:
+                for override_symbol, override_session, tp_atr in config.session_tp_atr_overrides:
+                    if symbol == override_symbol and current_session == override_session:
+                        atr = float(frame.atr.iloc[index])
+                        if np.isfinite(atr) and atr > 0:
+                            plan.target = plan.entry + signal * tp_atr * atr
+                        break
             if rejection is None and plan is None:
                 rejection = broker.last_plan_rejection or "invalid_plan_or_margin"
             if rejection is None and config.cost_reward_gate:
