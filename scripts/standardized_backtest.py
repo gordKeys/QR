@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument(
         "--profile",
-        choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "target_session_mix", "diagnostic", "suite"),
+        choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause", "diagnostic", "suite"),
         default="live",
         help="Run one profile or all four profiles with suite.",
     )

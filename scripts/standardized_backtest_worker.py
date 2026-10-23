@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkforward-step-days", type=int, required=True)
     parser.add_argument("--walkforward-windows", type=int, required=True)
     parser.add_argument("--diagnostic", action="store_true")
-    parser.add_argument("--profile", choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "target_session_mix", "diagnostic"), default="live")
+    parser.add_argument("--profile", choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause", "diagnostic"), default="live")
     return parser.parse_args()
 
 
@@ -139,20 +139,24 @@ def main() -> None:
         new_york_tp_atr=1.0 if args.profile == "ny_tp_1atr" else None,
         allowed_sessions_by_symbol=(
             (("EURUSD", ("Asia", "London")), ("GBPUSD", ("London",)))
-            if args.profile == "target_session_mix" else ()
+            if args.profile == "target_session_mix" else
+            (("EURUSD", ("Asia",)), ("GBPUSD", ("London",)), ("XAUUSD", ("NewYork",)))
+            if args.profile in {"target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else ()
         ),
         session_tp_atr_overrides=(
             (("EURUSD", "London", 1.5),)
             if args.profile == "target_session_mix" else ()
         ),
         continue_after_ftmo_breach=args.diagnostic or args.profile == "diagnostic",
-        regime_gate=args.profile in {"gbp_london_quality", "target_session_mix"},
-        m30_gate=args.profile in {"gbp_london_quality", "target_session_mix"},
+        loss_pause_after=3 if args.profile == "target_session_mix_xau_ny_pause" else 2,
+        loss_pause_hours=3,
+        regime_gate=args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"},
+        m30_gate=args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"},
         block_new_york_symbols=("GBPUSD",) if args.profile == "gbp_london_quality" else (("EURUSD", "GBPUSD") if args.profile in {"ny_blocked", "target_session_mix"} else ()),
-        regime_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix"} else (),
-        m30_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix"} else (),
-        spread_guard_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix"} else (),
-        max_spread_atr_ratio=0.20 if args.profile in {"gbp_london_quality", "target_session_mix"} else None,
+        regime_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else (),
+        m30_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else (),
+        spread_guard_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else (),
+        max_spread_atr_ratio=0.20 if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else None,
     )
 
     print("full-sample backtest started", flush=True)

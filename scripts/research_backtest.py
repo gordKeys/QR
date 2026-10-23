@@ -59,6 +59,8 @@ class ExperimentConfig:
     new_york_tp_atr: float | None = None
     allowed_sessions_by_symbol: tuple[tuple[str, tuple[str, ...]], ...] = ()
     session_tp_atr_overrides: tuple[tuple[str, str, float], ...] = ()
+    loss_pause_after: int = 2
+    loss_pause_hours: int = 3
     continue_after_ftmo_breach: bool = False
     regime_symbols: tuple[str, ...] = ()
     m30_symbols: tuple[str, ...] = ()
@@ -521,8 +523,8 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                 del positions[symbol]
                 if result["pnl"] < 0:
                     consecutive_losses += 1
-                    if consecutive_losses >= 2:
-                        pause_until = timestamp + pd.Timedelta(hours=3)
+                    if consecutive_losses >= config.loss_pause_after:
+                        pause_until = timestamp + pd.Timedelta(hours=config.loss_pause_hours)
                 else:
                     consecutive_losses, pause_until = 0, None
         floating_total = sum(price_value(pos, float(frames[symbol].loc[timestamp].close), specs) for symbol, pos in positions.items() if timestamp in frames[symbol].index)
