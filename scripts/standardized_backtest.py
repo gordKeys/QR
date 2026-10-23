@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument(
         "--profile",
-        choices=("live", "ny_blocked", "ny_tp_1atr", "diagnostic", "suite"),
+        choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "diagnostic", "suite"),
         default="live",
         help="Run one profile or all four profiles with suite.",
     )
@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     started = time.perf_counter()
-    profiles = ["live", "ny_blocked", "ny_tp_1atr", "diagnostic"] if args.profile == "suite" else [args.profile]
+    profiles = ["live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "diagnostic"] if args.profile == "suite" else [args.profile]
     print(
         f"[standardized] starting branch={args.branch} "
         f"commits={len(args.commits) if args.commits else args.previous_count + 1} "

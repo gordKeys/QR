@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkforward-step-days", type=int, required=True)
     parser.add_argument("--walkforward-windows", type=int, required=True)
     parser.add_argument("--diagnostic", action="store_true")
-    parser.add_argument("--profile", choices=("live", "ny_blocked", "ny_tp_1atr", "diagnostic"), default="live")
+    parser.add_argument("--profile", choices=("live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "diagnostic"), default="live")
     return parser.parse_args()
 
 
@@ -58,6 +58,29 @@ def run(frames, specs, news, initial, config, execution_frames, start=None, end=
         execution_frames=selected_execution,
     )
     return trades, equity, pd.DataFrame(candidates)
+
+
+def candidate_diagnostics(candidates: pd.DataFrame) -> dict:
+    if candidates.empty:
+        return {"candidates": 0, "by_symbol": {}, "by_symbol_session_reason": []}
+    by_symbol = {}
+    for symbol, group in candidates.groupby("symbol"):
+        by_symbol[symbol] = {
+            "candidates": int(len(group)),
+            "accepted": int(group["accepted"].sum()),
+            "rejected": int((~group["accepted"]).sum()),
+            "rejection_reasons": group.loc[~group["accepted"], "rejection_reason"].value_counts().to_dict(),
+        }
+    grouped = (
+        candidates.groupby(["symbol", "session", "rejection_reason"])
+        .size()
+        .reset_index(name="count")
+    )
+    return {
+        "candidates": int(len(candidates)),
+        "by_symbol": by_symbol,
+        "by_symbol_session_reason": grouped.to_dict("records"),
+    }
 
 
 def main() -> None:
@@ -107,16 +130,21 @@ def main() -> None:
     news = pd.DataFrame(columns=["time", "currency", "title"])
     config = backtest.ExperimentConfig(
         f"standardized_{args.profile}_profile",
-        regime_gate=False,
-        m30_gate=False,
         session_guard=True,
         cost_reward_gate=False,
         no_chase_gate=False,
         exit_management=False,
         max_open_positions=args.max_open_positions,
         daily_soft_stop_pct=0.03,
-        block_new_york_symbols=("EURUSD", "GBPUSD") if args.profile == "ny_blocked" else (),
         new_york_tp_atr=1.0 if args.profile == "ny_tp_1atr" else None,
+        continue_after_ftmo_breach=args.diagnostic or args.profile == "diagnostic",
+        regime_gate=args.profile == "gbp_london_quality",
+        m30_gate=args.profile == "gbp_london_quality",
+        block_new_york_symbols=("GBPUSD",) if args.profile == "gbp_london_quality" else (("EURUSD", "GBPUSD") if args.profile == "ny_blocked" else ()),
+        regime_symbols=("GBPUSD",) if args.profile == "gbp_london_quality" else (),
+        m30_symbols=("GBPUSD",) if args.profile == "gbp_london_quality" else (),
+        spread_guard_symbols=("GBPUSD",) if args.profile == "gbp_london_quality" else (),
+        max_spread_atr_ratio=0.20 if args.profile == "gbp_london_quality" else None,
     )
 
     print("full-sample backtest started", flush=True)
@@ -138,6 +166,7 @@ def main() -> None:
         "config": backtest.asdict(config),
         "raw_strategy_signal_counts": signal_counts,
         "full_sample": backtest.report_metrics(trades, equity, args.initial_balance),
+        "candidate_diagnostics": candidate_diagnostics(candidates),
         "walkforward": [],
         "limitations": [
             "Research engine uses M5 bars, not tick data.",
@@ -145,6 +174,7 @@ def main() -> None:
             "Live GBPUSD break-even and dual-XAU execution are not represented by older research engines.",
             "XAUUSD trades require the branch XAU strategy's signal and plan guards; raw signal counts and candidate rejections are recorded for diagnosis.",
         ],
+        "diagnostic_mode": bool(config.continue_after_ftmo_breach),
     }
 
     start = max(frame.index.min() for frame in frames.values())
@@ -189,6 +219,7 @@ def main() -> None:
                 "metrics": backtest.report_metrics(
                     window_trades, window_equity, args.initial_balance
                 ),
+                "candidate_diagnostics": candidate_diagnostics(window_candidates),
             }
         )
         print(

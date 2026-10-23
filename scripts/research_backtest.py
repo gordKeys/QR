@@ -57,6 +57,13 @@ class ExperimentConfig:
     daily_soft_stop_pct: float | None = None
     block_new_york_symbols: tuple[str, ...] = ()
     new_york_tp_atr: float | None = None
+    continue_after_ftmo_breach: bool = False
+    regime_symbols: tuple[str, ...] = ()
+    m30_symbols: tuple[str, ...] = ()
+    spread_guard_symbols: tuple[str, ...] = ()
+    max_spread_atr_ratio: float | None = None
+    no_trade_accra_start_hour: int = 20
+    no_trade_accra_end_hour: int = 23
 
 
 EXPERIMENTS = {
@@ -105,6 +112,7 @@ class ResearchBroker:
         self.specs = specs
         self.symbol = None
         self.price = 0.0
+        self.last_plan_rejection = None
         self.mt5 = SimpleNamespace(TIMEFRAME_M15="M15")
 
     def set_context(self, symbol, price):
@@ -388,6 +396,7 @@ def later_target_reached(result, frames, lookahead_bars=288):
 
 
 def build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context):
+    broker.last_plan_rejection = None
     data = frame.iloc[max(0, index - 700): index + 1]
     broker.set_context(symbol, float(frame.close.iloc[index]))
     price = float(frame.close.iloc[index])
@@ -396,6 +405,7 @@ def build_plan(symbol, frame, index, signal, score, components, equity, broker, 
     else:
         atr = float(frame.atr.iloc[index])
         if not np.isfinite(atr) or atr <= 0:
+            broker.last_plan_rejection = "missing_atr"
             return None
         stop, target = RiskManager().calculate_sl_tp(
             signal,
@@ -405,13 +415,25 @@ def build_plan(symbol, frame, index, signal, score, components, equity, broker, 
         )
         plan = {"signal": signal, "price": price, "stop": stop, "target": target}
     if not plan:
+        broker.last_plan_rejection = "strategy_plan_rejected"
         return None
-    info = broker.specs[symbol]
+    try:
+        info = broker.specs[symbol]
+    except KeyError:
+        broker.last_plan_rejection = "contract_spec_missing"
+        return None
     stop_distance = abs(float(plan["price"]) - float(plan["stop"]))
+    if not np.isfinite(stop_distance) or stop_distance <= 0:
+        broker.last_plan_rejection = "invalid_stop_distance"
+        return None
     risk = equity * RISK_BY_SYMBOL.get(symbol, 0.005)
     raw = risk / max(stop_distance * info.tick_value / info.tick_size, 1e-12)
     volume = broker.normalize_volume(symbol, raw)
-    if volume < info.volume_min or broker.order_calc_margin(signal, symbol, volume, float(plan["price"])) > equity * 0.85:
+    if volume < info.volume_min:
+        broker.last_plan_rejection = "volume_below_minimum"
+        return None
+    if broker.order_calc_margin(signal, symbol, volume, float(plan["price"])) > equity * 0.85:
+        broker.last_plan_rejection = "margin_exceeded"
         return None
     return Position(symbol, signal, frame.index[index], float(plan["price"]), float(plan["stop"]), float(plan["target"]), volume, risk, score, components, strategy.__class__.__name__, regime_label(frame, index), news_context, index, commission(volume), info.spread_price * volume * info.tick_value / info.tick_size)
 
@@ -507,23 +529,28 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
         daily_limit = daily_base - initial_balance * DAILY_LOSS_PCT
         total_limit = initial_balance * (1 - TOTAL_LOSS_PCT)
         if equity <= daily_limit or equity <= total_limit:
-            for symbol, pos in list(positions.items()):
-                if timestamp in frames[symbol].index:
-                    result = exit_trade(pos, timestamp, float(frames[symbol].loc[timestamp].close), "FTMO_limit", balance, specs, specs[symbol].spread_price, slippage_points * specs[symbol].point, 0)
-                    balance = result["balance_after"]
-                    trades.append(result)
-                    del positions[symbol]
-            equity = balance
-            if equity <= total_limit:
-                total_blocked = True
-            if equity <= daily_limit:
-                daily_blocked = True
+            if config.continue_after_ftmo_breach:
+                # Diagnostic mode records the breach through the equity curve but
+                # deliberately keeps positions and entries running for comparison.
+                pass
+            else:
+                for symbol, pos in list(positions.items()):
+                    if timestamp in frames[symbol].index:
+                        result = exit_trade(pos, timestamp, float(frames[symbol].loc[timestamp].close), "FTMO_limit", balance, specs, specs[symbol].spread_price, slippage_points * specs[symbol].point, 0)
+                        balance = result["balance_after"]
+                        trades.append(result)
+                        del positions[symbol]
+                equity = balance
+                if equity <= total_limit:
+                    total_blocked = True
+                if equity <= daily_limit:
+                    daily_blocked = True
         equity_rows.append({"time": timestamp, "balance": balance, "equity": equity, "daily_limit": daily_limit, "total_limit": total_limit, "peak_equity": peak})
         for symbol, frame in frames.items():
             if timestamp not in frame.index or symbol in positions or len(positions) >= config.max_open_positions or (pause_until and timestamp < pause_until) or daily_blocked or total_blocked:
                 continue
             local = timestamp.tz_convert("Africa/Accra")
-            if local.weekday() < 5 and 21 <= local.hour < 23:
+            if local.weekday() < 5 and config.no_trade_accra_start_hour <= local.hour < config.no_trade_accra_end_hour:
                 continue
             index = frame.index.get_loc(timestamp)
             signal = int(signals[symbol].iloc[index])
@@ -537,6 +564,10 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             news_near = news_blocked(news, symbol, timestamp, 60, 60)
             news_block = news_blocked(news, symbol, timestamp, 5, 10)
             news_context = "near_news" if news_near else "no_news"
+            atr_value = float(frame.atr.iloc[index])
+            spread_atr_ratio = None
+            if np.isfinite(atr_value) and atr_value > 0:
+                spread_atr_ratio = float(frame.spread.iloc[index]) * specs[symbol].point / atr_value
             rejection = None
             if news_block:
                 rejection = "news_blackout"
@@ -544,19 +575,21 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                 rejection = "new_york_blocked"
             elif config.session_guard and not session_allows(symbol, int(score or 0), timestamp):
                 rejection = "session_filter"
-            elif config.regime_gate and symbol in {"EURUSD", "GBPUSD"} and regime["label"] != "ranging":
+            elif config.regime_gate and symbol in (set(config.regime_symbols) or {"EURUSD", "GBPUSD"}) and regime["label"] != "ranging":
                 rejection = "regime_filter"
-            elif config.m30_gate and symbol in {"EURUSD", "GBPUSD"} and not m30_allows_mean_reversion(frame, index):
+            elif config.m30_gate and symbol in (set(config.m30_symbols) or {"EURUSD", "GBPUSD"}) and not m30_allows_mean_reversion(frame, index):
                 rejection = "m30_regime_filter"
             elif config.no_chase_gate and components.get("current_z") is not None and abs(float(components["current_z"])) > 2.75:
                 rejection = "no_chase"
+            elif config.max_spread_atr_ratio is not None and symbol in config.spread_guard_symbols and (spread_atr_ratio is None or spread_atr_ratio > config.max_spread_atr_ratio):
+                rejection = "spread_too_wide"
             plan = None if rejection else build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context)
             if plan is not None and config.new_york_tp_atr is not None and symbol in {"EURUSD", "GBPUSD"} and session_is_new_york(timestamp):
                 atr = float(frame.atr.iloc[index])
                 if np.isfinite(atr) and atr > 0:
                     plan.target = plan.entry + signal * config.new_york_tp_atr * atr
             if rejection is None and plan is None:
-                rejection = "invalid_plan_or_margin"
+                rejection = broker.last_plan_rejection or "invalid_plan_or_margin"
             if rejection is None and config.cost_reward_gate:
                 info = specs[symbol]
                 gross_target = abs(plan.target - plan.entry) * plan.volume * info.tick_value / info.tick_size
@@ -584,6 +617,7 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                 "news_context": news_context,
                 "spread_points": float(frame.spread.iloc[index]),
                 "atr": float(frame.atr.iloc[index]),
+                "spread_atr_ratio": spread_atr_ratio,
                 "entry_price": plan.entry if plan else None,
                 "stop": plan.stop if plan else None,
                 "target": plan.target if plan else None,
@@ -625,15 +659,27 @@ def report_metrics(trades, equity, initial):
     gross_profit, gross_loss = wins.pnl.sum(), -losses.pnl.sum()
     commission = trades[["entry_commission", "exit_commission"]].sum().sum() if not trades.empty else 0
     spread = trades[["entry_spread", "exit_spread_cost"]].sum().sum() if not trades.empty else 0
-    summary = {"start_balance": initial, "end_balance": float(curve.iloc[-1]), "net_pnl": float(curve.iloc[-1] - initial), "trades": int(len(trades)), "win_rate_pct": float(len(wins) / len(trades) * 100) if len(trades) else 0, "profit_factor": float(gross_profit / gross_loss) if gross_loss else None, "expectancy_per_trade": float(trades.pnl.mean()) if not trades.empty else 0, "average_win": float(wins.pnl.mean()) if not wins.empty else 0, "average_loss": float(losses.pnl.mean()) if not losses.empty else 0, "max_drawdown_usd": float(dd.min()), "max_drawdown_pct": float((dd / curve.cummax() * 100).min()), "max_daily_drawdown_usd": float(daily.min()), "max_daily_drawdown_pct": float(daily.min() / initial * 100), "longest_losing_streak": longest, "average_holding_hours": float((pd.to_datetime(trades.exit_time, utc=True) - pd.to_datetime(trades.opened_at, utc=True)).dt.total_seconds().mean() / 3600) if not trades.empty else 0, "commission_as_pct_gross_profit": float(commission / gross_profit * 100) if gross_profit > 0 else None, "spread_as_pct_gross_profit": float(spread / gross_profit * 100) if gross_profit > 0 else None, "mae_average": float(trades.mae_usd.mean()) if not trades.empty else 0, "mfe_average": float(trades.mfe_usd.mean()) if not trades.empty else 0, "stopped_before_later_tp_pct": None, "ftmo_daily_pass": bool(daily.min() >= -initial * DAILY_LOSS_PCT), "ftmo_total_pass": bool(curve.min() >= initial * (1 - TOTAL_LOSS_PCT))}
+    daily_breaches = equity[equity.equity <= equity.daily_limit]
+    total_breaches = equity[equity.equity <= equity.total_limit]
+    daily_breach_times = pd.to_datetime(daily_breaches["time"], utc=True) if not daily_breaches.empty else pd.Series(dtype="datetime64[ns, UTC]")
+    summary = {"start_balance": initial, "end_balance": float(curve.iloc[-1]), "net_pnl": float(curve.iloc[-1] - initial), "trades": int(len(trades)), "winning_trades": int(len(wins)), "losing_trades": int(len(losses)), "win_rate_pct": float(len(wins) / len(trades) * 100) if len(trades) else 0, "profit_factor": float(gross_profit / gross_loss) if gross_loss else None, "expectancy_per_trade": float(trades.pnl.mean()) if not trades.empty else 0, "average_win": float(wins.pnl.mean()) if not wins.empty else 0, "average_loss": float(losses.pnl.mean()) if not losses.empty else 0, "max_drawdown_usd": float(dd.min()), "max_drawdown_pct": float((dd / curve.cummax() * 100).min()), "max_daily_drawdown_usd": float(daily.min()), "max_daily_drawdown_pct": float(daily.min() / initial * 100), "longest_losing_streak": longest, "average_holding_hours": float((pd.to_datetime(trades.exit_time, utc=True) - pd.to_datetime(trades.opened_at, utc=True)).dt.total_seconds().mean() / 3600) if not trades.empty else 0, "commission_as_pct_gross_profit": float(commission / gross_profit * 100) if gross_profit > 0 else None, "spread_as_pct_gross_profit": float(spread / gross_profit * 100) if gross_profit > 0 else None, "mae_average": float(trades.mae_usd.mean()) if not trades.empty else 0, "mfe_average": float(trades.mfe_usd.mean()) if not trades.empty else 0, "stopped_before_later_tp_pct": None, "daily_breach_count": int(daily_breach_times.dt.tz_convert("Europe/Prague").dt.date.nunique()) if not daily_breaches.empty else 0, "total_breach": bool(not total_breaches.empty), "first_daily_breach": str(daily_breaches.time.iloc[0]) if not daily_breaches.empty else None, "first_total_breach": str(total_breaches.time.iloc[0]) if not total_breaches.empty else None, "ftmo_daily_pass": bool(daily.min() >= -initial * DAILY_LOSS_PCT), "ftmo_total_pass": bool(curve.min() >= initial * (1 - TOTAL_LOSS_PCT))}
     summary["by_symbol"] = {}
     if not trades.empty:
         for symbol, group in trades.groupby("symbol"):
-            summary["by_symbol"][symbol] = {"trades": int(len(group)), "pnl": float(group.pnl.sum()), "win_rate_pct": float((group.pnl > 0).mean() * 100), "expectancy": float(group.pnl.mean()), "average_mae": float(group.mae_usd.mean()), "average_mfe": float(group.mfe_usd.mean())}
+            group_wins = group[group.pnl > 0]
+            group_losses = group[group.pnl <= 0]
+            group_gross_loss = -group_losses.pnl.sum()
+            summary["by_symbol"][symbol] = {"trades": int(len(group)), "wins": int(len(group_wins)), "losses": int(len(group_losses)), "pnl": float(group.pnl.sum()), "win_rate_pct": float((group.pnl > 0).mean() * 100), "profit_factor": float(group_wins.pnl.sum() / group_gross_loss) if group_gross_loss else None, "expectancy": float(group.pnl.mean()), "average_win": float(group_wins.pnl.mean()) if not group_wins.empty else 0, "average_loss": float(group_losses.pnl.mean()) if not group_losses.empty else 0, "average_mae": float(group.mae_usd.mean()), "average_mfe": float(group.mfe_usd.mean())}
         for name, group in trades.groupby(trades.strategy):
             summary.setdefault("by_strategy", {})[name] = {"trades": int(len(group)), "pnl": float(group.pnl.sum()), "win_rate_pct": float((group.pnl > 0).mean() * 100), "expectancy": float(group.pnl.mean())}
         trades["session"] = pd.to_datetime(trades.opened_at, utc=True).dt.tz_convert("Europe/London").dt.hour.map(lambda h: "Asia" if h < 8 else "London" if h < 13 else "NewYork" if h < 21 else "Late")
         summary["by_session"] = trades.groupby("session").pnl.agg(["count", "sum", "mean"]).to_dict("index")
+        summary["by_symbol_session"] = {}
+        for (symbol, session), group in trades.groupby(["symbol", "session"]):
+            group_wins = group[group.pnl > 0]
+            group_losses = group[group.pnl <= 0]
+            group_gross_loss = -group_losses.pnl.sum()
+            summary["by_symbol_session"].setdefault(symbol, {})[session] = {"trades": int(len(group)), "wins": int(len(group_wins)), "losses": int(len(group_losses)), "win_rate_pct": float((group.pnl > 0).mean() * 100), "net_pnl": float(group.pnl.sum()), "average_pnl": float(group.pnl.mean()), "profit_factor": float(group_wins.pnl.sum() / group_gross_loss) if group_gross_loss else None, "average_mae": float(group.mae_usd.mean()), "average_mfe": float(group.mfe_usd.mean())}
         trades["score_group"] = trades.score.fillna("n/a").astype(str)
         summary["by_score"] = trades.groupby("score_group").pnl.agg(["count", "sum", "mean"]).to_dict("index")
         summary["by_regime"] = trades.groupby("regime").pnl.agg(["count", "sum", "mean"]).to_dict("index")

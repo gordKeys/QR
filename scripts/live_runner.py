@@ -43,6 +43,8 @@ SYMBOL_SL_ATR_BASE = {"EURUSD": 2.5, "GBPUSD": 2.0, "XAUUSD": 1.25}
 SYMBOL_TP_ATR_BASE = {"EURUSD": 3.5, "GBPUSD": 3.5, "XAUUSD": 1.75}
 DYNAMIC_ATR_SYMBOLS = {"GBPUSD", "XAUUSD"}
 BREAK_EVEN_ENABLED = True
+NO_ENTRY_ACCRA_START_HOUR = 20
+NO_ENTRY_ACCRA_END_HOUR = 23
 BREAK_EVEN_SYMBOL = "GBPUSD"
 BREAK_EVEN_TP_FRACTION = 0.50
 EUR_GBP_RISK_CAP_PCT = 0.03
@@ -974,6 +976,20 @@ def main():
 
                 atr = float(data["atr"].iloc[-1])
                 broker_time = data.index[-1].to_pydatetime()
+                accra_time = pd.Timestamp(broker_time).tz_convert("Africa/Accra")
+                if NO_ENTRY_ACCRA_START_HOUR <= accra_time.hour < NO_ENTRY_ACCRA_END_HOUR:
+                    print(f"{symbol}: skipped during Ghana no-entry window (20:00-23:00)")
+                    append_jsonl(
+                        run_log,
+                        {
+                            "event": "skip",
+                            "symbol": symbol,
+                            "reason": "ghana_no_entry_window",
+                            "accra_time": str(accra_time),
+                        },
+                    )
+                    cycle_counts["ghana_no_entry_window"] += 1
+                    continue
                 spread_points = None
 
                 if broker and not args.dry_run:
