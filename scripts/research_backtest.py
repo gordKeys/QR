@@ -55,6 +55,8 @@ class ExperimentConfig:
     max_open_positions: int = MAX_OPEN_POSITIONS
     shared_fx_risk: float | None = None
     daily_soft_stop_pct: float | None = None
+    block_new_york_symbols: tuple[str, ...] = ()
+    new_york_tp_atr: float | None = None
 
 
 EXPERIMENTS = {
@@ -325,6 +327,10 @@ def session_allows(symbol, score, timestamp):
     return True
 
 
+def session_is_new_york(timestamp):
+    return session_name(timestamp) == "NewYork"
+
+
 def load_news(path):
     if not path:
         return pd.DataFrame(columns=["time", "currency", "title"])
@@ -534,6 +540,8 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             rejection = None
             if news_block:
                 rejection = "news_blackout"
+            elif symbol in config.block_new_york_symbols and session_is_new_york(timestamp):
+                rejection = "new_york_blocked"
             elif config.session_guard and not session_allows(symbol, int(score or 0), timestamp):
                 rejection = "session_filter"
             elif config.regime_gate and symbol in {"EURUSD", "GBPUSD"} and regime["label"] != "ranging":
@@ -543,6 +551,10 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             elif config.no_chase_gate and components.get("current_z") is not None and abs(float(components["current_z"])) > 2.75:
                 rejection = "no_chase"
             plan = None if rejection else build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context)
+            if plan is not None and config.new_york_tp_atr is not None and symbol in {"EURUSD", "GBPUSD"} and session_is_new_york(timestamp):
+                atr = float(frame.atr.iloc[index])
+                if np.isfinite(atr) and atr > 0:
+                    plan.target = plan.entry + signal * config.new_york_tp_atr * atr
             if rejection is None and plan is None:
                 rejection = "invalid_plan_or_margin"
             if rejection is None and config.cost_reward_gate:

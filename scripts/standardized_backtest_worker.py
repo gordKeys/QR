@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkforward-step-days", type=int, required=True)
     parser.add_argument("--walkforward-windows", type=int, required=True)
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--profile", choices=("live", "ny_blocked", "ny_tp_1atr", "diagnostic"), default="live")
     return parser.parse_args()
 
 
@@ -56,7 +57,7 @@ def run(frames, specs, news, initial, config, execution_frames, start=None, end=
         candidates,
         execution_frames=selected_execution,
     )
-    return trades, equity
+    return trades, equity, pd.DataFrame(candidates)
 
 
 def main() -> None:
@@ -79,11 +80,17 @@ def main() -> None:
         flush=True,
     )
     frames, specs, names = backtest.load_cached(symbols, data_dir)
+    router = backtest.StrategyRouter()
+    signal_counts = {
+        symbol: int((router.get_strategy(symbol).generate_signals(frames[symbol]) != 0).sum())
+        for symbol in symbols
+    }
     print(
         "loaded M5 data: "
         + ", ".join(f"{symbol}={len(frames[symbol])} bars" for symbol in symbols),
         flush=True,
     )
+    print(f"raw strategy signal counts: {signal_counts}", flush=True)
     execution_frames = {}
     for symbol in symbols:
         paths = sorted(data_dir.glob(f"*{symbol}*_M1.csv"))
@@ -99,7 +106,7 @@ def main() -> None:
     )
     news = pd.DataFrame(columns=["time", "currency", "title"])
     config = backtest.ExperimentConfig(
-        "standardized_live_profile",
+        f"standardized_{args.profile}_profile",
         regime_gate=False,
         m30_gate=False,
         session_guard=True,
@@ -108,11 +115,13 @@ def main() -> None:
         exit_management=False,
         max_open_positions=args.max_open_positions,
         daily_soft_stop_pct=0.03,
+        block_new_york_symbols=("EURUSD", "GBPUSD") if args.profile == "ny_blocked" else (),
+        new_york_tp_atr=1.0 if args.profile == "ny_tp_1atr" else None,
     )
 
     print("full-sample backtest started", flush=True)
     full_started = time.perf_counter()
-    trades, equity = run(frames, specs, news, args.initial_balance, config, execution_frames)
+    trades, equity, candidates = run(frames, specs, news, args.initial_balance, config, execution_frames)
     print(
         f"full-sample backtest complete: trades={len(trades)} "
         f"elapsed={time.perf_counter() - full_started:.1f}s",
@@ -120,17 +129,21 @@ def main() -> None:
     )
     trades.to_csv(output / "trades_full.csv", index=False)
     equity.to_csv(output / "equity_full.csv", index=False)
+    if not candidates.empty:
+        candidates.to_csv(output / "candidates_full.csv", index=False)
     report = {
         "symbols": symbols,
         "broker_symbols": names,
         "risk_by_symbol": risk,
         "config": backtest.asdict(config),
+        "raw_strategy_signal_counts": signal_counts,
         "full_sample": backtest.report_metrics(trades, equity, args.initial_balance),
         "walkforward": [],
         "limitations": [
             "Research engine uses M5 bars, not tick data.",
             "Historical news is not included unless the engine is extended with a frozen news file.",
             "Live GBPUSD break-even and dual-XAU execution are not represented by older research engines.",
+            "XAUUSD trades require the branch XAU strategy's signal and plan guards; raw signal counts and candidate rejections are recorded for diagnosis.",
         ],
     }
 
@@ -152,7 +165,7 @@ def main() -> None:
             f"started: {cursor} to {window_end}",
             flush=True,
         )
-        window_trades, window_equity = run(
+        window_trades, window_equity, window_candidates = run(
             frames,
             specs,
             news,
@@ -166,6 +179,8 @@ def main() -> None:
         window_output.mkdir(exist_ok=True)
         window_trades.to_csv(window_output / "trades.csv", index=False)
         window_equity.to_csv(window_output / "equity.csv", index=False)
+        if not window_candidates.empty:
+            window_candidates.to_csv(window_output / "candidates.csv", index=False)
         report["walkforward"].append(
             {
                 "window": window_number + 1,

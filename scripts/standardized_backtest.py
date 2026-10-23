@@ -65,16 +65,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkforward-step-days", type=int, default=15)
     parser.add_argument("--walkforward-windows", type=int, default=10)
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=("live", "ny_blocked", "ny_tp_1atr", "diagnostic", "suite"),
+        default="live",
+        help="Run one profile or all four profiles with suite.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     started = time.perf_counter()
+    profiles = ["live", "ny_blocked", "ny_tp_1atr", "diagnostic"] if args.profile == "suite" else [args.profile]
     print(
         f"[standardized] starting branch={args.branch} "
         f"commits={len(args.commits) if args.commits else args.previous_count + 1} "
-        f"symbols={','.join(args.symbols)}",
+        f"profiles={','.join(profiles)} symbols={','.join(args.symbols)}",
         flush=True,
     )
     data_dir = Path(args.data_dir).resolve()
@@ -120,6 +127,7 @@ def main() -> None:
         "data_dir": str(data_dir),
         "data_files": data_files,
         "symbols": symbols,
+        "profiles": profiles,
         "initial_balance": args.initial_balance,
         "risk_by_symbol": risk,
         "commission_round_turn_per_lot": 5.0,
@@ -148,62 +156,52 @@ def main() -> None:
         commit_output = output / short
         worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
         try:
-            commit_started = time.perf_counter()
-            print(
-                f"[standardized] commit {commit_number}/{len(commits)} "
-                f"{short}: starting worker",
-                flush=True,
-            )
             command("git", "worktree", "add", "--detach", str(worktree), commit)
-            worker_copy = worktree / "scripts" / WORKER.name
-            shutil.copy2(WORKER, worker_copy)
-            shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
-            worker_args = [
-                sys.executable,
-                str(worker_copy),
-                "--data-dir", str(data_dir),
-                "--output", str(commit_output),
-                "--initial-balance", str(args.initial_balance),
-                "--symbols", *symbols,
-                "--risk-json", json.dumps(risk, separators=(",", ":")),
-                "--daily-loss-pct", str(args.daily_loss_pct),
-                "--total-loss-pct", str(args.total_loss_pct),
-                "--max-open-positions", str(args.max_open_positions),
-                "--walkforward-window-days", str(args.walkforward_window_days),
-                "--walkforward-step-days", str(args.walkforward_step_days),
-                "--walkforward-windows", str(args.walkforward_windows),
-            ]
-            if args.diagnostic:
-                worker_args.append("--diagnostic")
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
-            process = subprocess.Popen(
-                worker_args,
-                cwd=worktree,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-            )
-            worker_output = []
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.rstrip()
-                worker_output.append(line)
-                print(f"[worker {short}] {line}", flush=True)
-            result_code = process.wait()
-            item = {"commit": commit, "status": "passed" if result_code == 0 else "failed", "output": str(commit_output)}
-            if result_code:
-                item["error"] = "\n".join(worker_output)[-4000:]
-            else:
-                item["report"] = json.loads((commit_output / "report.json").read_text(encoding="utf-8"))
-            results.append(item)
-            print(
-                f"[standardized] commit {commit_number}/{len(commits)} {short}: "
-                f"{item['status']} ({time.perf_counter() - commit_started:.1f}s)",
-                flush=True,
-            )
+            for profile in profiles:
+                profile_started = time.perf_counter()
+                profile_output = commit_output / profile if len(profiles) > 1 else commit_output
+                print(
+                    f"[standardized] commit {commit_number}/{len(commits)} {short} "
+                    f"profile={profile}: starting worker",
+                    flush=True,
+                )
+                worker_copy = worktree / "scripts" / WORKER.name
+                shutil.copy2(WORKER, worker_copy)
+                shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
+                worker_args = [
+                    sys.executable, str(worker_copy),
+                    "--data-dir", str(data_dir), "--output", str(profile_output),
+                    "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
+                    "--risk-json", json.dumps(risk, separators=(",", ":")),
+                    "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
+                    "--max-open-positions", str(args.max_open_positions),
+                    "--walkforward-window-days", str(args.walkforward_window_days),
+                    "--walkforward-step-days", str(args.walkforward_step_days),
+                    "--walkforward-windows", str(args.walkforward_windows), "--profile", profile,
+                ]
+                if args.diagnostic or profile == "diagnostic":
+                    worker_args.append("--diagnostic")
+                env = os.environ.copy()
+                env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
+                process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                worker_output = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    line = line.rstrip()
+                    worker_output.append(line)
+                    print(f"[worker {short}/{profile}] {line}", flush=True)
+                result_code = process.wait()
+                item = {"commit": commit, "profile": profile,
+                        "status": "passed" if result_code == 0 else "failed",
+                        "output": str(profile_output)}
+                if result_code:
+                    item["error"] = "\n".join(worker_output)[-4000:]
+                else:
+                    item["report"] = json.loads((profile_output / "report.json").read_text(encoding="utf-8"))
+                results.append(item)
+                print(f"[standardized] {short}/{profile}: {item['status']} "
+                      f"({time.perf_counter() - profile_started:.1f}s)", flush=True)
         finally:
             command("git", "worktree", "remove", "--force", str(worktree), check=False)
             shutil.rmtree(worktree, ignore_errors=True)
