@@ -117,6 +117,11 @@ def session_name(timestamp):
     return "Late"
 
 
+def utc_timestamp(value):
+    timestamp = pd.Timestamp(value)
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
+
+
 def risk_from_position(position, broker):
     stop = float(getattr(position, "sl", 0.0) or 0.0)
     entry = float(getattr(position, "price_open", 0.0) or 0.0)
@@ -322,7 +327,7 @@ def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, tra
     if session_name(current_time) != "NewYork":
         print(f"XAUUSD dual: session blocked ({session_name(current_time)})")
         return
-    accra_time = pd.Timestamp(current_time).tz_convert("Africa/Accra")
+    accra_time = utc_timestamp(current_time).tz_convert("Africa/Accra")
     if NO_ENTRY_ACCRA_START_HOUR <= accra_time.hour < NO_ENTRY_ACCRA_END_HOUR:
         print("XAUUSD dual: skipped during Ghana no-entry window (20:00-23:00)")
         return
@@ -987,7 +992,7 @@ def main():
 
                 atr = float(data["atr"].iloc[-1])
                 broker_time = data.index[-1].to_pydatetime()
-                accra_time = pd.Timestamp(broker_time).tz_convert("Africa/Accra")
+                accra_time = utc_timestamp(broker_time).tz_convert("Africa/Accra")
                 if NO_ENTRY_ACCRA_START_HOUR <= accra_time.hour < NO_ENTRY_ACCRA_END_HOUR:
                     print(f"{symbol}: skipped during Ghana no-entry window (20:00-23:00)")
                     append_jsonl(
