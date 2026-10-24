@@ -32,9 +32,9 @@ from xau_dual_runner import (
 
 BOT_MAGIC = 26072026
 SYMBOL_RISK_OVERRIDES = {
-    "EURUSD": 0.01,
-    "GBPUSD": 0.01,
-    "XAUUSD": 0.01,
+    "EURUSD": 0.0075,
+    "GBPUSD": 0.0075,
+    "XAUUSD": 0.0075,
 }
 SYMBOL_TP_ATR_OVERRIDES = {
     "EURUSD": 3.5,
@@ -47,16 +47,21 @@ NO_ENTRY_ACCRA_START_HOUR = 20
 NO_ENTRY_ACCRA_END_HOUR = 23
 BREAK_EVEN_SYMBOL = "GBPUSD"
 BREAK_EVEN_TP_FRACTION = 0.50
-EUR_GBP_RISK_CAP_PCT = 0.03
+EUR_GBP_RISK_CAP_PCT = 0.015
 DAILY_SOFT_STOP_PCT = 0.03
 HARD_LOSS_STOP_PCT = 0.038
 BLOCK_NEW_YORK_ENTRIES = True
 DUAL_XAU_ENABLED = True
 XAU_TRAILING_ENABLED = False
-XAU_CURRENT_RISK = 0.005
-XAU_TRAILING_RISK = 0.005
+XAU_CURRENT_RISK = 0.0075
+XAU_TRAILING_RISK = 0.0075
 POSITION_GROUPS = {
     "EUR_GBP": {"EURUSD", "GBPUSD"},
+}
+LIVE_ALLOWED_SESSIONS = {
+    "EURUSD": {"Asia"},
+    "GBPUSD": {"London"},
+    "XAUUSD": {"NewYork"},
 }
 
 
@@ -181,20 +186,18 @@ def entry_quality_block(
 ):
     if symbol in {"EURUSD", "GBPUSD"}:
         session, context = entry_context(data, regime, signal, spread_points)
-        if symbol == "EURUSD" and session == "NewYork":
-            return "new_york_session_blocked", session, context
-        if symbol == "GBPUSD" and session != "Asia":
-            return "gbpusd_session_blocked", session, context
-        if regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging":
+        if session not in LIVE_ALLOWED_SESSIONS[symbol]:
+            return f"{symbol.lower()}_session_blocked", session, context
+        if symbol == "GBPUSD" and (regime["m15"].get("score", 0) < 5 or regime["m15"].get("label") != "ranging"):
             return "m15_regime_not_ranging", session, context
-        if m30_filter_enabled and regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
+        if symbol == "GBPUSD" and m30_filter_enabled and regime["m30"].get("label") == "trending" and context["m30_opposes_reversion"]:
             return "m30_opposes_reversion", session, context
-        if context["candle_body_ratio"] < 0.20 or context["candle_body_ratio"] > 0.90:
+        if symbol == "GBPUSD" and (context["candle_body_ratio"] < 0.20 or context["candle_body_ratio"] > 0.90):
             return "poor_candle_quality", session, context
         current_z = score_components.get("current_z") if score_components else None
-        if current_z is not None and abs(float(current_z)) > 3.5:
+        if symbol == "GBPUSD" and current_z is not None and abs(float(current_z)) > 3.5:
             return "no_chase_extreme", session, context
-        if score is not None and score < 4:
+        if symbol == "GBPUSD" and score is not None and score < 4:
             return "score_below_4", session, context
         return None, session, context
     session, context = entry_context(data, regime, signal, spread_points)
@@ -314,6 +317,14 @@ def run_dual_xau_cycle(broker, broker_symbol, router, equity, max_positions, tra
     data = load_xau_dual_data(broker, broker_symbol)
     if data is None or data.empty:
         print("XAUUSD dual: no data")
+        return
+    current_time = data.index[-1]
+    if session_name(current_time) != "NewYork":
+        print(f"XAUUSD dual: session blocked ({session_name(current_time)})")
+        return
+    accra_time = pd.Timestamp(current_time).tz_convert("Africa/Accra")
+    if NO_ENTRY_ACCRA_START_HOUR <= accra_time.hour < NO_ENTRY_ACCRA_END_HOUR:
+        print("XAUUSD dual: skipped during Ghana no-entry window (20:00-23:00)")
         return
     positions = [
         position for position in broker.positions_get()
@@ -555,7 +566,7 @@ def main():
     parser.add_argument("--max-spread-points", type=float, default=30.0)
     parser.add_argument("--max-candle-atr", type=float, default=2.5)
     parser.add_argument("--max-atr-ratio", type=float, default=3.0)
-    parser.add_argument("--enable-m30-filter", action="store_true")
+    parser.add_argument("--enable-m30-filter", action="store_true", default=True)
     parser.add_argument("--disable-m30-filter", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--mt5-path", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe")
     args = parser.parse_args()
@@ -600,7 +611,7 @@ def main():
     )
     print(f"FTMO account type: {args.account_type}")
     print("Portfolio limit: 2 positions globally")
-    print("Risk: EURUSD=0.50%, GBPUSD=0.50%, XAUUSD=0.50% current sleeve")
+    print("Risk: EURUSD=0.75%, GBPUSD=0.75%, XAUUSD=0.75% active current sleeve (0.75% per XAU sleeve)")
     print(f"Dual XAU runner: {'ON' if DUAL_XAU_ENABLED else 'OFF'} | current magic={CURRENT_MAGIC}")
     print(f"XAU trailing breakout: {'ON' if XAU_TRAILING_ENABLED else 'OFF'}")
     print("Entry routing: EURUSD=relaxed, GBPUSD=live/current, XAUUSD=relaxed")
