@@ -30,6 +30,38 @@ RISK_MATRIX = {
     "all_1pct": {"EURUSD": 0.01, "GBPUSD": 0.01, "XAUUSD": 0.01},
     "eur2_gbp1_xau1": {"EURUSD": 0.02, "GBPUSD": 0.01, "XAUUSD": 0.01},
 }
+ATR_MATRIX = {
+    "baseline": {
+        "EURUSD": {"sl": 2.5, "tp": 5.0}, "GBPUSD": {"sl": 2.5, "tp": 5.0}, "XAUUSD": {"sl": 1.5, "tp": 2.25},
+    },
+    "balanced": {
+        "EURUSD": {"sl": 2.5, "tp": 4.0}, "GBPUSD": {"sl": 2.5, "tp": 4.0}, "XAUUSD": {"sl": 1.5, "tp": 2.0},
+    },
+    "tighter": {
+        "EURUSD": {"sl": 2.0, "tp": 3.5}, "GBPUSD": {"sl": 2.0, "tp": 3.5}, "XAUUSD": {"sl": 1.25, "tp": 1.75},
+    },
+    "wider": {
+        "EURUSD": {"sl": 3.0, "tp": 5.0}, "GBPUSD": {"sl": 3.0, "tp": 4.5}, "XAUUSD": {"sl": 1.75, "tp": 2.5},
+    },
+    "eur_tight": {
+        "EURUSD": {"sl": 2.0, "tp": 4.0}, "GBPUSD": {"sl": 2.5, "tp": 5.0}, "XAUUSD": {"sl": 1.5, "tp": 2.25},
+    },
+    "eur_wide": {
+        "EURUSD": {"sl": 3.0, "tp": 5.5}, "GBPUSD": {"sl": 2.5, "tp": 5.0}, "XAUUSD": {"sl": 1.5, "tp": 2.25},
+    },
+    "gbp_tight": {
+        "EURUSD": {"sl": 2.5, "tp": 5.0}, "GBPUSD": {"sl": 2.0, "tp": 3.5}, "XAUUSD": {"sl": 1.5, "tp": 2.25},
+    },
+    "gbp_wide": {
+        "EURUSD": {"sl": 2.5, "tp": 5.0}, "GBPUSD": {"sl": 3.0, "tp": 4.5}, "XAUUSD": {"sl": 1.5, "tp": 2.25},
+    },
+    "xau_tight": {
+        "EURUSD": {"sl": 2.5, "tp": 5.0}, "GBPUSD": {"sl": 2.5, "tp": 5.0}, "XAUUSD": {"sl": 1.25, "tp": 1.75},
+    },
+    "xau_wide": {
+        "EURUSD": {"sl": 2.5, "tp": 5.0}, "GBPUSD": {"sl": 2.5, "tp": 5.0}, "XAUUSD": {"sl": 1.75, "tp": 2.5},
+    },
+}
 
 
 def command(*parts: str, cwd: Path = ROOT, check: bool = True) -> str:
@@ -67,6 +99,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk", default='{"EURUSD":0.01,"GBPUSD":0.01,"XAUUSD":0.01}')
     parser.add_argument("--risk-matrix", action="store_true",
                         help="Run the built-in five-profile risk matrix into separate folders.")
+    parser.add_argument("--atr", default=json.dumps(ATR_MATRIX["baseline"]),
+                        help="JSON mapping symbol to SL/TP ATR multipliers.")
+    parser.add_argument("--atr-matrix", action="store_true",
+                        help="Run the built-in per-symbol ATR matrix into separate folders.")
     parser.add_argument("--daily-loss-pct", type=float, default=0.05)
     parser.add_argument("--total-loss-pct", type=float, default=0.10)
     parser.add_argument("--soft-stop-pct", type=float, default=0.03,
@@ -101,7 +137,10 @@ def main() -> None:
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     symbols = [symbol.upper() for symbol in args.symbols]
+    if args.risk_matrix and args.atr_matrix:
+        raise ValueError("--risk-matrix and --atr-matrix cannot be combined")
     risk_sets = list(RISK_MATRIX.items()) if args.risk_matrix else [("single", json.loads(args.risk))]
+    atr_sets = list(ATR_MATRIX.items()) if args.atr_matrix else [("single", json.loads(args.atr))]
     if args.download_mt5:
         downloader = ROOT / "scripts" / "download_mt5_history.py"
         for timeframe in ("M1", "M5"):
@@ -144,6 +183,8 @@ def main() -> None:
         "initial_balance": args.initial_balance,
         "risk_matrix": dict(risk_sets) if args.risk_matrix else None,
         "risk_by_symbol": None if args.risk_matrix else risk_sets[0][1],
+        "atr_matrix": dict(atr_sets) if args.atr_matrix else None,
+        "atr_by_symbol": None if args.atr_matrix else atr_sets[0][1],
         "commission_round_turn_per_lot": 5.0,
         "slippage_points": 1.0,
         "daily_loss_pct": args.daily_loss_pct,
@@ -166,62 +207,65 @@ def main() -> None:
 
     results = []
     for risk_name, risk in risk_sets:
-        risk_output = output / risk_name if args.risk_matrix else output
-        for commit_number, commit in enumerate(commits, start=1):
-            short = commit[:12]
-            commit_output = risk_output / short
-            worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
-            try:
-                command("git", "worktree", "add", "--detach", str(worktree), commit)
-                for profile in profiles:
-                    profile_started = time.perf_counter()
-                    profile_output = commit_output / profile if len(profiles) > 1 else commit_output
-                    print(
-                        f"[standardized] risk={risk_name} commit {commit_number}/{len(commits)} {short} "
-                        f"profile={profile}: starting worker",
-                        flush=True,
-                    )
-                    worker_copy = worktree / "scripts" / WORKER.name
-                    shutil.copy2(WORKER, worker_copy)
-                    shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
-                    worker_args = [
-                        sys.executable, str(worker_copy),
-                        "--data-dir", str(data_dir), "--output", str(profile_output),
-                        "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
-                        "--risk-json", json.dumps(risk, separators=(",", ":")),
-                        "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
-                        "--soft-stop-pct", str(args.soft_stop_pct),
-                        "--max-open-positions", str(args.max_open_positions),
-                        "--walkforward-window-days", str(args.walkforward_window_days),
-                        "--walkforward-step-days", str(args.walkforward_step_days),
-                        "--walkforward-windows", str(args.walkforward_windows), "--profile", profile,
-                    ]
-                    if args.diagnostic or profile == "diagnostic":
-                        worker_args.append("--diagnostic")
-                    env = os.environ.copy()
-                    env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
-                    process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
-                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
-                    worker_output = []
-                    assert process.stdout is not None
-                    for line in process.stdout:
-                        line = line.rstrip()
-                        worker_output.append(line)
-                        print(f"[worker {risk_name}/{short}/{profile}] {line}", flush=True)
-                    result_code = process.wait()
-                    item = {"risk_profile": risk_name, "risk_by_symbol": risk, "commit": commit, "profile": profile,
-                            "status": "passed" if result_code == 0 else "failed",
-                            "output": str(profile_output)}
-                    if result_code:
-                        item["error"] = "\n".join(worker_output)[-4000:]
-                    else:
-                        item["report"] = json.loads((profile_output / "report.json").read_text(encoding="utf-8"))
-                    results.append(item)
-                    print(f"[standardized] {risk_name}/{short}/{profile}: {item['status']} "
-                          f"({time.perf_counter() - profile_started:.1f}s)", flush=True)
-            finally:
-                command("git", "worktree", "remove", "--force", str(worktree), check=False)
-                shutil.rmtree(worktree, ignore_errors=True)
+        for atr_name, atr in atr_sets:
+            variant_name = atr_name if args.atr_matrix else risk_name
+            variant_output = output / variant_name if (args.atr_matrix or args.risk_matrix) else output
+            for commit_number, commit in enumerate(commits, start=1):
+                short = commit[:12]
+                commit_output = variant_output / short
+                worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
+                try:
+                    command("git", "worktree", "add", "--detach", str(worktree), commit)
+                    for profile in profiles:
+                        profile_started = time.perf_counter()
+                        profile_output = commit_output / profile if len(profiles) > 1 else commit_output
+                        print(
+                            f"[standardized] risk={risk_name} atr={atr_name} commit {commit_number}/{len(commits)} {short} "
+                            f"profile={profile}: starting worker",
+                            flush=True,
+                        )
+                        worker_copy = worktree / "scripts" / WORKER.name
+                        shutil.copy2(WORKER, worker_copy)
+                        shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
+                        worker_args = [
+                            sys.executable, str(worker_copy),
+                            "--data-dir", str(data_dir), "--output", str(profile_output),
+                            "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
+                            "--risk-json", json.dumps(risk, separators=(",", ":")),
+                            "--atr-json", json.dumps(atr, separators=(",", ":")),
+                            "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
+                            "--soft-stop-pct", str(args.soft_stop_pct),
+                            "--max-open-positions", str(args.max_open_positions),
+                            "--walkforward-window-days", str(args.walkforward_window_days),
+                            "--walkforward-step-days", str(args.walkforward_step_days),
+                            "--walkforward-windows", str(args.walkforward_windows), "--profile", profile,
+                        ]
+                        if args.diagnostic or profile == "diagnostic":
+                            worker_args.append("--diagnostic")
+                        env = os.environ.copy()
+                        env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
+                        process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                        worker_output = []
+                        assert process.stdout is not None
+                        for line in process.stdout:
+                            line = line.rstrip()
+                            worker_output.append(line)
+                            print(f"[worker {risk_name}/{atr_name}/{short}/{profile}] {line}", flush=True)
+                        result_code = process.wait()
+                        item = {"risk_profile": risk_name, "risk_by_symbol": risk, "atr_profile": atr_name, "atr_by_symbol": atr, "commit": commit, "profile": profile,
+                                "status": "passed" if result_code == 0 else "failed",
+                                "output": str(profile_output)}
+                        if result_code:
+                            item["error"] = "\n".join(worker_output)[-4000:]
+                        else:
+                            item["report"] = json.loads((profile_output / "report.json").read_text(encoding="utf-8"))
+                        results.append(item)
+                        print(f"[standardized] {risk_name}/{atr_name}/{short}/{profile}: {item['status']} "
+                              f"({time.perf_counter() - profile_started:.1f}s)", flush=True)
+                finally:
+                    command("git", "worktree", "remove", "--force", str(worktree), check=False)
+                    shutil.rmtree(worktree, ignore_errors=True)
     (output / "results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
     print(
         json.dumps(

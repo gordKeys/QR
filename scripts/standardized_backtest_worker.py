@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-balance", type=float, required=True)
     parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument("--risk-json", required=True)
+    parser.add_argument("--atr-json", required=True)
     parser.add_argument("--daily-loss-pct", type=float, required=True)
     parser.add_argument("--total-loss-pct", type=float, required=True)
     parser.add_argument("--soft-stop-pct", type=float, required=True)
@@ -89,6 +90,7 @@ def main() -> None:
     started = time.perf_counter()
     symbols = [symbol.upper() for symbol in args.symbols]
     risk = json.loads(args.risk_json)
+    atr_settings = json.loads(args.atr_json)
     backtest.SYMBOLS = symbols
     backtest.RISK_BY_SYMBOL = risk
     backtest.DAILY_LOSS_PCT = args.daily_loss_pct
@@ -158,6 +160,10 @@ def main() -> None:
         m30_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else (),
         spread_guard_symbols=("GBPUSD",) if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else (),
         max_spread_atr_ratio=0.20 if args.profile in {"gbp_london_quality", "target_session_mix", "target_session_mix_xau_ny", "target_session_mix_xau_ny_pause"} else None,
+        atr_overrides=tuple(
+            (symbol, float(values["sl"]), float(values["tp"]))
+            for symbol, values in atr_settings.items()
+        ),
     )
 
     print("full-sample backtest started", flush=True)
@@ -176,6 +182,7 @@ def main() -> None:
         "symbols": symbols,
         "broker_symbols": names,
         "risk_by_symbol": risk,
+        "atr_by_symbol": atr_settings,
         "config": backtest.asdict(config),
         "raw_strategy_signal_counts": signal_counts,
         "full_sample": backtest.report_metrics(trades, equity, args.initial_balance),

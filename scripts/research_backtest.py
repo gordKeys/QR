@@ -68,6 +68,7 @@ class ExperimentConfig:
     max_spread_atr_ratio: float | None = None
     no_trade_accra_start_hour: int = 20
     no_trade_accra_end_hour: int = 23
+    atr_overrides: tuple[tuple[str, float, float], ...] = ()
 
 
 EXPERIMENTS = {
@@ -592,6 +593,15 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
             elif config.max_spread_atr_ratio is not None and symbol in config.spread_guard_symbols and (spread_atr_ratio is None or spread_atr_ratio > config.max_spread_atr_ratio):
                 rejection = "spread_too_wide"
             plan = None if rejection else build_plan(symbol, frame, index, signal, score, components, equity, broker, strategy, news_context)
+            if plan is not None:
+                atr_override = dict((item[0], item[1:]) for item in config.atr_overrides).get(symbol)
+                if atr_override:
+                    atr = float(frame.atr.iloc[index])
+                    if np.isfinite(atr) and atr > 0:
+                        sl_atr, tp_atr = atr_override
+                        entry = float(plan["price"])
+                        plan["stop"] = entry - signal * float(sl_atr) * atr
+                        plan["target"] = entry + signal * float(tp_atr) * atr
             if plan is not None and config.new_york_tp_atr is not None and symbol in {"EURUSD", "GBPUSD"} and session_is_new_york(timestamp):
                 atr = float(frame.atr.iloc[index])
                 if np.isfinite(atr) and atr > 0:
