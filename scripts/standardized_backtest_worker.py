@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-json", required=True)
     parser.add_argument("--daily-loss-pct", type=float, required=True)
     parser.add_argument("--total-loss-pct", type=float, required=True)
+    parser.add_argument("--soft-stop-pct", type=float, required=True)
     parser.add_argument("--max-open-positions", type=int, required=True)
     parser.add_argument("--walkforward-window-days", type=int, required=True)
     parser.add_argument("--walkforward-step-days", type=int, required=True)
@@ -135,7 +136,7 @@ def main() -> None:
         no_chase_gate=False,
         exit_management=False,
         max_open_positions=args.max_open_positions,
-        daily_soft_stop_pct=0.03,
+        daily_soft_stop_pct=args.soft_stop_pct,
         new_york_tp_atr=1.0 if args.profile == "ny_tp_1atr" else None,
         allowed_sessions_by_symbol=(
             (("EURUSD", ("Asia", "London")), ("GBPUSD", ("London",)))

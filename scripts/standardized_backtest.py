@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk", default='{"EURUSD":0.01,"GBPUSD":0.01,"XAUUSD":0.01}')
     parser.add_argument("--daily-loss-pct", type=float, default=0.05)
     parser.add_argument("--total-loss-pct", type=float, default=0.10)
+    parser.add_argument("--soft-stop-pct", type=float, default=0.03,
+                        help="Internal daily entry stop; keep below --daily-loss-pct.")
     parser.add_argument("--max-open-positions", type=int, default=2)
     parser.add_argument("--walkforward-window-days", type=int, default=30)
     parser.add_argument("--walkforward-step-days", type=int, default=15)
@@ -76,6 +78,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.soft_stop_pct >= args.daily_loss_pct:
+        raise ValueError("--soft-stop-pct must be below the FTMO --daily-loss-pct")
     started = time.perf_counter()
     profiles = ["live", "ny_blocked", "gbp_london_quality", "ny_tp_1atr", "diagnostic"] if args.profile == "suite" else [args.profile]
     print(
@@ -173,7 +177,8 @@ def main() -> None:
                     "--data-dir", str(data_dir), "--output", str(profile_output),
                     "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
                     "--risk-json", json.dumps(risk, separators=(",", ":")),
-                    "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
+                "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
+                "--soft-stop-pct", str(args.soft_stop_pct),
                     "--max-open-positions", str(args.max_open_positions),
                     "--walkforward-window-days", str(args.walkforward_window_days),
                     "--walkforward-step-days", str(args.walkforward_step_days),
