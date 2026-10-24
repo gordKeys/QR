@@ -685,6 +685,7 @@ def report_metrics(trades, equity, initial):
             group_losses = group[group.pnl <= 0]
             group_gross_loss = -group_losses.pnl.sum()
             summary["by_symbol"][symbol] = {"trades": int(len(group)), "wins": int(len(group_wins)), "losses": int(len(group_losses)), "pnl": float(group.pnl.sum()), "win_rate_pct": float((group.pnl > 0).mean() * 100), "profit_factor": float(group_wins.pnl.sum() / group_gross_loss) if group_gross_loss else None, "expectancy": float(group.pnl.mean()), "average_win": float(group_wins.pnl.mean()) if not group_wins.empty else 0, "average_loss": float(group_losses.pnl.mean()) if not group_losses.empty else 0, "average_mae": float(group.mae_usd.mean()), "average_mfe": float(group.mfe_usd.mean())}
+        summary["drawdown_attribution"] = drawdown_attribution(trades, equity, initial)
         for name, group in trades.groupby(trades.strategy):
             summary.setdefault("by_strategy", {})[name] = {"trades": int(len(group)), "pnl": float(group.pnl.sum()), "win_rate_pct": float((group.pnl > 0).mean() * 100), "expectancy": float(group.pnl.mean())}
         trades["session"] = pd.to_datetime(trades.opened_at, utc=True).dt.tz_convert("Europe/London").dt.hour.map(lambda h: "Asia" if h < 8 else "London" if h < 13 else "NewYork" if h < 21 else "Late")
@@ -701,6 +702,83 @@ def report_metrics(trades, equity, initial):
         summary["by_news_context"] = trades.groupby("news_context").pnl.agg(["count", "sum", "mean"]).to_dict("index")
         summary["stopped_before_later_tp_pct"] = float(trades.stopped_before_later_tp.mean() * 100) if "stopped_before_later_tp" in trades else None
     return summary
+
+
+def drawdown_attribution(trades, equity, initial):
+    """Describe symbol drawdowns using realized trade events.
+
+    The portfolio equity curve includes floating P/L and intrabar effects, so
+    symbol-level attribution is reported separately from that curve. Each
+    symbol's standalone curve and each leave-one-symbol-out curve are built
+    from chronologically realized trade P/L. This is an attribution diagnostic,
+    not an additive decomposition of the portfolio's exact intrabar drawdown.
+    """
+    if trades.empty:
+        return {}
+    events = trades.copy()
+    events["exit_time"] = pd.to_datetime(events["exit_time"], utc=True)
+    events = events.sort_values(["exit_time", "symbol"]).reset_index(drop=True)
+
+    def curve_stats(group):
+        if group.empty:
+            return {
+                "trades": 0,
+                "net_pnl": 0.0,
+                "max_drawdown_usd": 0.0,
+                "max_drawdown_pct": 0.0,
+                "worst_drawdown_start": None,
+                "worst_drawdown_end": None,
+            }
+        balances = initial + group["pnl"].cumsum()
+        peaks = balances.cummax()
+        drawdowns = balances - peaks
+        trough_index = drawdowns.idxmin()
+        peak_index = balances.loc[:trough_index].idxmax()
+        peak_balance = float(peaks.loc[trough_index])
+        return {
+            "trades": int(len(group)),
+            "net_pnl": float(group["pnl"].sum()),
+            "max_drawdown_usd": float(drawdowns.min()),
+            "max_drawdown_pct": float(drawdowns.min() / peak_balance * 100.0) if peak_balance else 0.0,
+            "worst_drawdown_start": str(group.loc[peak_index, "exit_time"]),
+            "worst_drawdown_end": str(group.loc[trough_index, "exit_time"]),
+        }
+
+    portfolio_stats = curve_stats(events)
+    worst_start = pd.Timestamp(portfolio_stats["worst_drawdown_start"])
+    worst_end = pd.Timestamp(portfolio_stats["worst_drawdown_end"])
+    result = {
+        "method": "realized_exit_pnl_curves",
+        "note": "Standalone and leave-one-out realized curves; not additive to the floating/intrabar portfolio drawdown.",
+        "portfolio_realized_curve": portfolio_stats,
+        "by_symbol": {},
+    }
+    symbols = sorted(events["symbol"].dropna().unique())
+    for symbol in symbols:
+        symbol_events = events[events["symbol"] == symbol]
+        standalone = curve_stats(symbol_events)
+        without_symbol = curve_stats(events[events["symbol"] != symbol])
+        worst_period = symbol_events[
+            (symbol_events["exit_time"] >= worst_start)
+            & (symbol_events["exit_time"] <= worst_end)
+        ]
+        result["by_symbol"][symbol] = {
+            **standalone,
+            "average_mae_usd": float(symbol_events["mae_usd"].mean()),
+            "worst_mae_usd": float(symbol_events["mae_usd"].min()),
+            "average_mfe_usd": float(symbol_events["mfe_usd"].mean()),
+            "portfolio_worst_period_pnl": float(worst_period["pnl"].sum()),
+            "portfolio_worst_period_trades": int(len(worst_period)),
+            "without_symbol_max_drawdown_usd": without_symbol["max_drawdown_usd"],
+            "without_symbol_max_drawdown_pct": without_symbol["max_drawdown_pct"],
+            "marginal_drawdown_impact_usd": float(
+                without_symbol["max_drawdown_usd"] - portfolio_stats["max_drawdown_usd"]
+            ),
+            "marginal_drawdown_impact_pct": float(
+                without_symbol["max_drawdown_pct"] - portfolio_stats["max_drawdown_pct"]
+            ),
+        }
+    return result
 
 
 def main():
