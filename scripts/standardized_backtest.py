@@ -23,6 +23,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("standardized_backtest_worker.py")
+RISK_MATRIX = {
+    "all_0.75pct": {"EURUSD": 0.0075, "GBPUSD": 0.0075, "XAUUSD": 0.0075},
+    "eur1_gbp0.75_xau0.5": {"EURUSD": 0.01, "GBPUSD": 0.0075, "XAUUSD": 0.005},
+    "eur1.5_gbp1_xau1": {"EURUSD": 0.015, "GBPUSD": 0.01, "XAUUSD": 0.01},
+    "all_1pct": {"EURUSD": 0.01, "GBPUSD": 0.01, "XAUUSD": 0.01},
+    "eur2_gbp1_xau1": {"EURUSD": 0.02, "GBPUSD": 0.01, "XAUUSD": 0.01},
+}
 
 
 def command(*parts: str, cwd: Path = ROOT, check: bool = True) -> str:
@@ -58,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "XAUUSD"])
     parser.add_argument("--initial-balance", type=float, default=100000.0)
     parser.add_argument("--risk", default='{"EURUSD":0.01,"GBPUSD":0.01,"XAUUSD":0.01}')
+    parser.add_argument("--risk-matrix", action="store_true",
+                        help="Run the built-in five-profile risk matrix into separate folders.")
     parser.add_argument("--daily-loss-pct", type=float, default=0.05)
     parser.add_argument("--total-loss-pct", type=float, default=0.10)
     parser.add_argument("--soft-stop-pct", type=float, default=0.03,
@@ -92,7 +101,7 @@ def main() -> None:
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     symbols = [symbol.upper() for symbol in args.symbols]
-    risk = json.loads(args.risk)
+    risk_sets = list(RISK_MATRIX.items()) if args.risk_matrix else [("single", json.loads(args.risk))]
     if args.download_mt5:
         downloader = ROOT / "scripts" / "download_mt5_history.py"
         for timeframe in ("M1", "M5"):
@@ -133,7 +142,8 @@ def main() -> None:
         "symbols": symbols,
         "profiles": profiles,
         "initial_balance": args.initial_balance,
-        "risk_by_symbol": risk,
+        "risk_matrix": dict(risk_sets) if args.risk_matrix else None,
+        "risk_by_symbol": None if args.risk_matrix else risk_sets[0][1],
         "commission_round_turn_per_lot": 5.0,
         "slippage_points": 1.0,
         "daily_loss_pct": args.daily_loss_pct,
@@ -155,68 +165,70 @@ def main() -> None:
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     results = []
-    for commit_number, commit in enumerate(commits, start=1):
-        short = commit[:12]
-        commit_output = output / short
-        worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
-        try:
-            command("git", "worktree", "add", "--detach", str(worktree), commit)
-            for profile in profiles:
-                profile_started = time.perf_counter()
-                profile_output = commit_output / profile if len(profiles) > 1 else commit_output
-                print(
-                    f"[standardized] commit {commit_number}/{len(commits)} {short} "
-                    f"profile={profile}: starting worker",
-                    flush=True,
-                )
-                worker_copy = worktree / "scripts" / WORKER.name
-                shutil.copy2(WORKER, worker_copy)
-                shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
-                worker_args = [
-                    sys.executable, str(worker_copy),
-                    "--data-dir", str(data_dir), "--output", str(profile_output),
-                    "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
-                    "--risk-json", json.dumps(risk, separators=(",", ":")),
-                "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
-                "--soft-stop-pct", str(args.soft_stop_pct),
-                    "--max-open-positions", str(args.max_open_positions),
-                    "--walkforward-window-days", str(args.walkforward_window_days),
-                    "--walkforward-step-days", str(args.walkforward_step_days),
-                    "--walkforward-windows", str(args.walkforward_windows), "--profile", profile,
-                ]
-                if args.diagnostic or profile == "diagnostic":
-                    worker_args.append("--diagnostic")
-                env = os.environ.copy()
-                env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
-                process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
-                worker_output = []
-                assert process.stdout is not None
-                for line in process.stdout:
-                    line = line.rstrip()
-                    worker_output.append(line)
-                    print(f"[worker {short}/{profile}] {line}", flush=True)
-                result_code = process.wait()
-                item = {"commit": commit, "profile": profile,
-                        "status": "passed" if result_code == 0 else "failed",
-                        "output": str(profile_output)}
-                if result_code:
-                    item["error"] = "\n".join(worker_output)[-4000:]
-                else:
-                    item["report"] = json.loads((profile_output / "report.json").read_text(encoding="utf-8"))
-                results.append(item)
-                print(f"[standardized] {short}/{profile}: {item['status']} "
-                      f"({time.perf_counter() - profile_started:.1f}s)", flush=True)
-        finally:
-            command("git", "worktree", "remove", "--force", str(worktree), check=False)
-            shutil.rmtree(worktree, ignore_errors=True)
+    for risk_name, risk in risk_sets:
+        risk_output = output / risk_name if args.risk_matrix else output
+        for commit_number, commit in enumerate(commits, start=1):
+            short = commit[:12]
+            commit_output = risk_output / short
+            worktree = Path(tempfile.mkdtemp(prefix=f"standardized-{short}-"))
+            try:
+                command("git", "worktree", "add", "--detach", str(worktree), commit)
+                for profile in profiles:
+                    profile_started = time.perf_counter()
+                    profile_output = commit_output / profile if len(profiles) > 1 else commit_output
+                    print(
+                        f"[standardized] risk={risk_name} commit {commit_number}/{len(commits)} {short} "
+                        f"profile={profile}: starting worker",
+                        flush=True,
+                    )
+                    worker_copy = worktree / "scripts" / WORKER.name
+                    shutil.copy2(WORKER, worker_copy)
+                    shutil.copy2(ROOT / "scripts" / "research_backtest.py", worktree / "scripts" / "research_backtest.py")
+                    worker_args = [
+                        sys.executable, str(worker_copy),
+                        "--data-dir", str(data_dir), "--output", str(profile_output),
+                        "--initial-balance", str(args.initial_balance), "--symbols", *symbols,
+                        "--risk-json", json.dumps(risk, separators=(",", ":")),
+                        "--daily-loss-pct", str(args.daily_loss_pct), "--total-loss-pct", str(args.total_loss_pct),
+                        "--soft-stop-pct", str(args.soft_stop_pct),
+                        "--max-open-positions", str(args.max_open_positions),
+                        "--walkforward-window-days", str(args.walkforward_window_days),
+                        "--walkforward-step-days", str(args.walkforward_step_days),
+                        "--walkforward-windows", str(args.walkforward_windows), "--profile", profile,
+                    ]
+                    if args.diagnostic or profile == "diagnostic":
+                        worker_args.append("--diagnostic")
+                    env = os.environ.copy()
+                    env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
+                    process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                    worker_output = []
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        line = line.rstrip()
+                        worker_output.append(line)
+                        print(f"[worker {risk_name}/{short}/{profile}] {line}", flush=True)
+                    result_code = process.wait()
+                    item = {"risk_profile": risk_name, "risk_by_symbol": risk, "commit": commit, "profile": profile,
+                            "status": "passed" if result_code == 0 else "failed",
+                            "output": str(profile_output)}
+                    if result_code:
+                        item["error"] = "\n".join(worker_output)[-4000:]
+                    else:
+                        item["report"] = json.loads((profile_output / "report.json").read_text(encoding="utf-8"))
+                    results.append(item)
+                    print(f"[standardized] {risk_name}/{short}/{profile}: {item['status']} "
+                          f"({time.perf_counter() - profile_started:.1f}s)", flush=True)
+            finally:
+                command("git", "worktree", "remove", "--force", str(worktree), check=False)
+                shutil.rmtree(worktree, ignore_errors=True)
     (output / "results.json").write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
     print(
         json.dumps(
             {
                 "manifest": str(output / "manifest.json"),
                 "results": str(output / "results.json"),
-                "commits": len(results),
+                "runs": len(results),
                 "elapsed_seconds": round(time.perf_counter() - started, 1),
             },
             indent=2,
