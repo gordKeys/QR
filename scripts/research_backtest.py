@@ -599,9 +599,9 @@ def simulate(frames, specs, news, initial_balance, slippage_points, config=None,
                     atr = float(frame.atr.iloc[index])
                     if np.isfinite(atr) and atr > 0:
                         sl_atr, tp_atr = atr_override
-                        entry = float(plan["price"])
-                        plan["stop"] = entry - signal * float(sl_atr) * atr
-                        plan["target"] = entry + signal * float(tp_atr) * atr
+                        entry = float(plan.entry)
+                        plan.stop = entry - signal * float(sl_atr) * atr
+                        plan.target = entry + signal * float(tp_atr) * atr
             if plan is not None and config.new_york_tp_atr is not None and symbol in {"EURUSD", "GBPUSD"} and session_is_new_york(timestamp):
                 atr = float(frame.atr.iloc[index])
                 if np.isfinite(atr) and atr > 0:

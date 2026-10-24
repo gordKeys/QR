@@ -244,8 +244,17 @@ def main() -> None:
                             worker_args.append("--diagnostic")
                         env = os.environ.copy()
                         env["PYTHONPATH"] = str(worktree) + os.pathsep + str(worktree / "scripts")
-                        process = subprocess.Popen(worker_args, cwd=worktree, env=env, text=True,
-                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                        process = subprocess.Popen(
+                            worker_args,
+                            cwd=worktree,
+                            env=env,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            bufsize=1,
+                        )
                         worker_output = []
                         assert process.stdout is not None
                         for line in process.stdout:
